@@ -192,15 +192,16 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
-    def add_accounts(self, tokens: list[str]) -> dict:
-        tokens = list(dict.fromkeys(token for token in tokens if token))
-        if not tokens:
+    def add_account_records(self, records: list[dict[str, Any]]) -> dict:
+        records = [record for record in records if isinstance(record, dict) and record.get("access_token")]
+        if not records:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
 
         with self._lock:
             added = 0
             skipped = 0
-            for access_token in tokens:
+            for record in records:
+                access_token = str(record.get("access_token") or "").strip()
                 current = self._accounts.get(access_token)
                 if current is None:
                     added += 1
@@ -210,8 +211,9 @@ class AccountService:
                 account = self._normalize_account(
                     {
                         **current,
+                        **record,
                         "access_token": access_token,
-                        "type": str(current.get("type") or "free"),
+                        "type": str(record.get("type") or current.get("type") or "free"),
                     }
                 )
                 if account is not None:
@@ -221,6 +223,9 @@ class AccountService:
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
         return {"added": added, "skipped": skipped, "items": items}
+
+    def add_accounts(self, tokens: list[str]) -> dict:
+        return self.add_account_records([{"access_token": token} for token in list(dict.fromkeys(token for token in tokens if token))])
 
     def delete_accounts(self, tokens: list[str]) -> dict:
         target_set = set(token for token in tokens if token)

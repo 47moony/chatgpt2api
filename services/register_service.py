@@ -164,7 +164,7 @@ class RegisterService:
                 cfg = self.get()
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
+                    futures.add(executor.submit(openai_register.worker, submitted, str(cfg.get("stats", {}).get("job_id") or "")))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break

@@ -42,7 +42,9 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
+  downloadSub2APIExport,
   fetchAccounts,
+  getSub2APIAccountsExportUrl,
   refreshAccounts,
   updateAccount,
   type Account,
@@ -266,6 +268,19 @@ function AccountsPageContent() {
     return items;
   }, [pageCount, safePage]);
 
+  const handleExportSub2API = async (proxy: boolean) => {
+    try {
+      await downloadSub2APIExport(
+        getSub2APIAccountsExportUrl(proxy),
+        `sub2api-accounts-${proxy ? "with-proxy" : "no-proxy"}.json`,
+      );
+      toast.success(proxy ? "已导出 sub2api JSON（自动分配代理）" : "已导出 sub2api JSON");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "导出 sub2api JSON 失败";
+      toast.error(message);
+    }
+  };
+
   const handleDeleteTokens = async (tokens: string[]) => {
     if (tokens.length === 0) {
       toast.error("请先选择要删除的账户");
@@ -393,6 +408,24 @@ function AccountsPageContent() {
           >
             <Download className="size-4" />
             导出全部 Token
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => void handleExportSub2API(false)}
+            disabled={accounts.length === 0}
+          >
+            <Download className="size-4" />
+            导出 sub2api
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => void handleExportSub2API(true)}
+            disabled={accounts.length === 0}
+          >
+            <Download className="size-4" />
+            sub2api+代理
           </Button>
         </div>
       </section>

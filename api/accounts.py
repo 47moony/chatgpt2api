@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
@@ -15,6 +16,7 @@ from api.support import (
 )
 from services.account_service import account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
+from services.sub2api_export_service import build_sub2api_export, json_bytes
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
@@ -23,6 +25,21 @@ from services.sub2api_service import (
 )
 
 
+
+def _sanitize_account(item: dict) -> dict:
+    return {key: value for key, value in item.items() if key != "oauth"}
+
+
+def _sanitize_accounts(items: list[dict]) -> list[dict]:
+    return [_sanitize_account(item) for item in items]
+
+
+def _json_download(payload: dict, filename: str) -> Response:
+    return Response(
+        content=json_bytes(payload),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 class UserKeyCreateRequest(BaseModel):
     name: str = ""
@@ -144,7 +161,14 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return {"items": _sanitize_accounts(account_service.list_accounts())}
+
+    @router.get("/api/accounts/export/sub2api")
+    async def export_accounts_sub2api(proxy: bool = False, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        payload = build_sub2api_export(account_service.list_accounts(), include_proxy=proxy)
+        suffix = "with-proxy" if proxy else "no-proxy"
+        return _json_download(payload, f"sub2api-accounts-{suffix}.json")
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -158,7 +182,7 @@ def create_router() -> APIRouter:
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
-            "items": refresh_result.get("items", result.get("items", [])),
+            "items": _sanitize_accounts(refresh_result.get("items", result.get("items", []))),
         }
 
     @router.delete("/api/accounts")
@@ -167,7 +191,8 @@ def create_router() -> APIRouter:
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return account_service.delete_accounts(tokens)
+        result = account_service.delete_accounts(tokens)
+        return {**result, "items": _sanitize_accounts(result.get("items", []))}
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
@@ -177,7 +202,8 @@ def create_router() -> APIRouter:
             access_tokens = account_service.list_tokens()
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        return account_service.refresh_accounts(access_tokens)
+        result = account_service.refresh_accounts(access_tokens)
+        return {**result, "items": _sanitize_accounts(result.get("items", []))}
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):
@@ -191,7 +217,7 @@ def create_router() -> APIRouter:
         account = account_service.update_account(access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return {"item": _sanitize_account(account), "items": _sanitize_accounts(account_service.list_accounts())}
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):

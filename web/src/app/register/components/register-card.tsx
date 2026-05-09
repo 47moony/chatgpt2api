@@ -1,6 +1,7 @@
 "use client";
 
-import { AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
+import { AlertTriangle, Download, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -8,6 +9,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { downloadSub2APIExport, getSub2APIRegisterExportUrl } from "@/lib/api";
 
 import { useSettingsStore } from "../../settings/store";
 
@@ -29,6 +31,19 @@ export function RegisterCard() {
   const save = useSettingsStore((state) => state.saveRegister);
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
+
+  const exportSub2API = async (proxy: boolean) => {
+    try {
+      await downloadSub2APIExport(
+        getSub2APIRegisterExportUrl(proxy),
+        `sub2api-register-${proxy ? "with-proxy" : "no-proxy"}.json`,
+      );
+      toast.success(proxy ? "已导出本轮注册 sub2api JSON（自动分配代理）" : "已导出本轮注册 sub2api JSON");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "导出本轮注册 sub2api JSON 失败";
+      toast.error(message);
+    }
+  };
 
   if (isLoading) {
     return (
@@ -264,7 +279,7 @@ export function RegisterCard() {
                 </div>
               ))}
             </div>
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
               <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving}>
                 {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : config.enabled ? <Square className="size-4" /> : <Play className="size-4" />}
                 {config.enabled ? "停止" : "启动"}
@@ -276,6 +291,14 @@ export function RegisterCard() {
               <Button variant="outline" className="h-10 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void save()} disabled={isSaving || config.enabled}>
                 <Save className="size-4" />
                 保存
+              </Button>
+              <Button variant="outline" className="h-10 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void exportSub2API(false)} disabled={(stats.success || 0) === 0}>
+                <Download className="size-4" />
+                导出
+              </Button>
+              <Button variant="outline" className="h-10 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void exportSub2API(true)} disabled={(stats.success || 0) === 0}>
+                <Download className="size-4" />
+                导出+代理
               </Button>
             </div>
             <div className="flex items-center gap-2 border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">

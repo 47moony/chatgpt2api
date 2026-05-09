@@ -9,7 +9,7 @@ import string
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -178,6 +178,102 @@ def _decode_jwt_payload(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
         return {}
+
+
+def _iso_from_unix(timestamp: int | float, tz: timezone = timezone.utc) -> str:
+    return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone(tz).isoformat(timespec="seconds")
+
+
+def _organization_id_from_payload(payload: dict) -> str:
+    auth = payload.get("https://api.openai.com/auth") if isinstance(payload, dict) else {}
+    auth = auth if isinstance(auth, dict) else {}
+    organizations = auth.get("organizations")
+    if isinstance(organizations, list):
+        for organization in organizations:
+            if isinstance(organization, dict) and organization.get("id"):
+                return str(organization.get("id") or "").strip()
+    return ""
+
+
+def build_sub2api_account(result: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    access_token = str(result.get("access_token") or "").strip()
+    id_token = str(result.get("id_token") or "").strip()
+    access_payload = _decode_jwt_payload(access_token)
+    id_payload = _decode_jwt_payload(id_token)
+    access_auth = access_payload.get("https://api.openai.com/auth") if isinstance(access_payload, dict) else {}
+    access_auth = access_auth if isinstance(access_auth, dict) else {}
+    id_auth = id_payload.get("https://api.openai.com/auth") if isinstance(id_payload, dict) else {}
+    id_auth = id_auth if isinstance(id_auth, dict) else {}
+    profile = access_payload.get("https://api.openai.com/profile") if isinstance(access_payload, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    email = str(result.get("email") or profile.get("email") or id_payload.get("email") or "").strip()
+    issued_at = int(access_payload.get("iat") or now.timestamp())
+    expires_at = int(access_payload.get("exp") or issued_at)
+    usage_updated_at = now.astimezone(timezone(timedelta(hours=8)))
+    organization_id = _organization_id_from_payload(id_payload) or _organization_id_from_payload(access_payload)
+    return {
+        "name": email,
+        "platform": "openai",
+        "type": "oauth",
+        "credentials": {
+            "_token_version": issued_at * 1000,
+            "access_token": access_token,
+            "chatgpt_account_id": str(access_auth.get("chatgpt_account_id") or id_auth.get("chatgpt_account_id") or "").strip(),
+            "chatgpt_user_id": str(access_auth.get("chatgpt_user_id") or access_auth.get("user_id") or id_auth.get("chatgpt_user_id") or id_auth.get("user_id") or "").strip(),
+            "email": email,
+            "expires_at": _iso_from_unix(expires_at, timezone(timedelta(hours=8))),
+            "expires_in": max(0, expires_at - int(now.timestamp())),
+            "id_token": id_token,
+            "organization_id": organization_id,
+            "refresh_token": str(result.get("refresh_token") or "").strip(),
+        },
+        "extra": {
+            "codex_5h_reset_after_seconds": 0,
+            "codex_5h_reset_at": usage_updated_at.isoformat(timespec="seconds"),
+            "codex_5h_used_percent": 0,
+            "codex_5h_window_minutes": 0,
+            "codex_7d_reset_after_seconds": 604800,
+            "codex_7d_reset_at": (usage_updated_at + timedelta(days=7)).isoformat(timespec="seconds"),
+            "codex_7d_used_percent": 0,
+            "codex_7d_window_minutes": 10080,
+            "codex_primary_over_secondary_percent": 0,
+            "codex_primary_reset_after_seconds": 604800,
+            "codex_primary_used_percent": 0,
+            "codex_primary_window_minutes": 10080,
+            "codex_secondary_reset_after_seconds": 0,
+            "codex_secondary_used_percent": 0,
+            "codex_secondary_window_minutes": 0,
+            "codex_usage_updated_at": usage_updated_at.isoformat(timespec="seconds"),
+            "email": email,
+            "privacy_mode": "training_off",
+        },
+        "concurrency": 10,
+        "priority": 1,
+        "rate_multiplier": 1,
+        "auto_pause_on_expired": True,
+    }
+
+
+def build_account_pool_record(result: dict, register_job_id: str = "") -> dict:
+    account = build_sub2api_account(result)
+    credentials = account["credentials"]
+    return {
+        "access_token": credentials["access_token"],
+        "email": credentials["email"] or None,
+        "register_job_id": str(register_job_id or "").strip() or None,
+        "oauth": {
+            "_token_version": credentials["_token_version"],
+            "refresh_token": credentials["refresh_token"],
+            "id_token": credentials["id_token"],
+            "organization_id": credentials["organization_id"],
+            "chatgpt_account_id": credentials["chatgpt_account_id"],
+            "chatgpt_user_id": credentials["chatgpt_user_id"],
+            "email": credentials["email"],
+            "expires_at": credentials["expires_at"],
+            "expires_in": credentials["expires_in"],
+        },
+    }
 
 
 def create_mailbox(username: str | None = None) -> dict:
@@ -603,7 +699,7 @@ class PlatformRegistrar:
         }
 
 
-def worker(index: int) -> dict:
+def worker(index: int, register_job_id: str = "") -> dict:
     start = time.time()
     registrar = PlatformRegistrar(config["proxy"])
     try:
@@ -611,7 +707,7 @@ def worker(index: int) -> dict:
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])
-        account_service.add_accounts([access_token])
+        account_service.add_account_records([build_account_pool_record(result, register_job_id)])
         account_service.refresh_accounts([access_token])
         with stats_lock:
             stats["done"] += 1

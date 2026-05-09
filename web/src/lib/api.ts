@@ -292,6 +292,33 @@ export async function updateAccount(
   });
 }
 
+export function getSub2APIAccountsExportUrl(proxy: boolean) {
+  const params = new URLSearchParams();
+  if (proxy) params.set("proxy", "true");
+  return `/api/accounts/export/sub2api${params.toString() ? `?${params.toString()}` : ""}`;
+}
+
+export function getSub2APIRegisterExportUrl(proxy: boolean) {
+  const params = new URLSearchParams();
+  if (proxy) params.set("proxy", "true");
+  return `/api/register/export/sub2api${params.toString() ? `?${params.toString()}` : ""}`;
+}
+
+export async function downloadSub2APIExport(url: string, fallbackName: string) {
+  const response = await request.get(url, { responseType: "blob" });
+  const blob = response.data as Blob;
+  const disposition = String(response.headers["content-disposition"] || "");
+  const filename = disposition.match(/filename="?([^";]+)"?/)?.[1] || fallbackName;
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(objectUrl);
+}
+
 export async function generateImage(prompt: string, model?: ImageModel, size?: string) {
   return httpRequest<ImageResponse>(
     "/v1/images/generations",

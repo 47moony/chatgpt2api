@@ -28,3 +28,5 @@ docker-compose-local.yml
 
 # Git cache
 git_cache/
+.claude/settings.json
+config.json
