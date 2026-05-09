@@ -289,7 +289,7 @@ class ConfigStore:
         return data
 
     def get_proxy_settings(self) -> str:
-        return str(self.data.get("proxy") or "").strip()
+        return str(os.getenv("CHATGPT2API_PROXY") or self.data.get("proxy") or "").strip()
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
