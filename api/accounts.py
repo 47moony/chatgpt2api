@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
@@ -16,7 +15,7 @@ from api.support import (
 )
 from services.account_service import account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
-from services.sub2api_export_service import build_sub2api_export, json_bytes
+from services.register_service import register_service
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
@@ -27,19 +26,109 @@ from services.sub2api_service import (
 
 
 def _sanitize_account(item: dict) -> dict:
-    return {key: value for key, value in item.items() if key != "oauth"}
+    sanitized = {key: value for key, value in item.items() if key != "oauth"}
+    login = sanitized.get("login")
+    if isinstance(login, dict):
+        sanitized["login"] = {key: value for key, value in login.items() if key != "password"}
+    return sanitized
 
 
 def _sanitize_accounts(items: list[dict]) -> list[dict]:
     return [_sanitize_account(item) for item in items]
 
 
-def _json_download(payload: dict, filename: str) -> Response:
-    return Response(
-        content=json_bytes(payload),
-        media_type="application/json; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+def _sanitize_account_errors(items: list[dict]) -> list[dict]:
+    sanitized: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        next_item = dict(item)
+        delete_token = str(next_item.get("delete_token") or "").strip()
+        token = str(next_item.pop("access_token", "") or next_item.get("token") or "").strip()
+        if token:
+            from utils.helper import anonymize_token
+
+            next_item["token"] = anonymize_token(token)
+        if delete_token:
+            next_item["delete_token"] = delete_token
+        sanitized.append(next_item)
+    return sanitized
+
+
+def _account_email(item: dict) -> str:
+    login = item.get("login") if isinstance(item.get("login"), dict) else {}
+    oauth = item.get("oauth") if isinstance(item.get("oauth"), dict) else {}
+    return str(item.get("email") or login.get("email") or oauth.get("email") or "").strip().lower()
+
+
+def _registered_records_by_email_and_token() -> tuple[dict[str, dict], dict[str, dict]]:
+    registered_records = register_service.registered_accounts()
+    records_by_email = {
+        str(item.get("email") or "").strip().lower(): item
+        for item in registered_records
+        if str(item.get("email") or "").strip()
+    }
+    records_by_token = {
+        str(item.get("access_token") or "").strip(): item
+        for item in registered_records
+        if str(item.get("access_token") or "").strip()
+    }
+    return records_by_email, records_by_token
+
+
+def _is_sub2api_owned_account(account: dict) -> bool:
+    return (
+        str(account.get("credential_owner") or "").strip() == "sub2api"
+        or bool(str(account.get("sub2api_account_id") or "").strip())
     )
+
+
+def _terminal_recovery_error(token: str, email: str, error: str) -> dict:
+    return {
+        "token": token,
+        "access_token": token,
+        "delete_token": token,
+        "email": email,
+        "error": error,
+        "terminal": True,
+        "terminal_action": "delete_local_pool",
+    }
+
+
+def _is_recoverable_auth_error(message: str) -> bool:
+    text = str(message or "").lower()
+    if register_service.is_terminal_account_error(text):
+        return False
+    network_markers = (
+        "tls",
+        "ssl",
+        "timed out",
+        "timeout",
+        "connection",
+        "proxy",
+        "temporarily unavailable",
+        "remote end closed",
+        "curl",
+    )
+    if any(marker in text for marker in network_markers):
+        return False
+    auth_markers = (
+        "401",
+        "unauthorized",
+        "token_invalidated",
+        "authentication token has been invalidated",
+        "invalid access token",
+        "invalid_access_token",
+        "refresh failed",
+        "refresh token unavailable",
+        "refresh_token_http_400",
+        "refresh_token_http_401",
+        "refresh_token_http_403",
+        "refresh_token_missing_access_token",
+        "refresh_token_missing_client_id",
+    )
+    return any(marker in text for marker in auth_markers)
+
 
 class UserKeyCreateRequest(BaseModel):
     name: str = ""
@@ -60,6 +149,10 @@ class AccountDeleteRequest(BaseModel):
 
 
 class AccountRefreshRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+
+
+class AccountRecoverRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
 
 
@@ -163,13 +256,6 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return {"items": _sanitize_accounts(account_service.list_accounts())}
 
-    @router.get("/api/accounts/export/sub2api")
-    async def export_accounts_sub2api(proxy: bool = False, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        payload = build_sub2api_export(account_service.list_accounts(), include_proxy=proxy)
-        suffix = "with-proxy" if proxy else "no-proxy"
-        return _json_download(payload, f"sub2api-accounts-{suffix}.json")
-
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -181,7 +267,7 @@ def create_router() -> APIRouter:
         return {
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
-            "errors": refresh_result.get("errors", []),
+            "errors": _sanitize_account_errors(refresh_result.get("errors", [])),
             "items": _sanitize_accounts(refresh_result.get("items", result.get("items", []))),
         }
 
@@ -202,7 +288,189 @@ def create_router() -> APIRouter:
             access_tokens = account_service.list_tokens()
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        result = account_service.refresh_accounts(access_tokens)
+        result = await run_in_threadpool(lambda: account_service.refresh_accounts(access_tokens, allow_token_refresh=True))
+        errors = list(result.get("errors") or [])
+
+        removed = 0
+        failed_tokens = [
+            str(item.get("access_token") or item.get("token") or "").strip()
+            for item in errors
+            if isinstance(item, dict)
+        ]
+        failed_tokens = [token for token in failed_tokens if token]
+
+        if failed_tokens:
+            current_accounts = {
+                str(item.get("access_token") or "").strip(): item
+                for item in account_service.list_accounts()
+                if str(item.get("access_token") or "").strip()
+            }
+            records_by_email, records_by_token = _registered_records_by_email_and_token()
+            terminal_tokens: list[str] = []
+
+            for item in errors:
+                if not isinstance(item, dict):
+                    continue
+                token = str(item.get("access_token") or item.get("token") or "").strip()
+                error = str(item.get("error") or "").strip()
+                if not token:
+                    continue
+                account = current_accounts.get(token) or {}
+                email = _account_email(account)
+                record = records_by_token.get(token) or records_by_email.get(email)
+                if register_service.is_terminal_account_error(error):
+                    terminal_tokens.append(token)
+                    continue
+                if record and str(record.get("password") or "").strip():
+                    item["email"] = email or str(record.get("email") or "").strip().lower()
+                    item["recovery_skipped_reason"] = "一键刷新不会自动重新登录，请在确认后手动点击恢复凭据"
+
+            if terminal_tokens:
+                delete_result = await run_in_threadpool(lambda: account_service.delete_accounts(terminal_tokens))
+                removed = int(delete_result.get("removed") or 0)
+                terminal_set = set(terminal_tokens)
+                errors = [
+                    item
+                    for item in errors
+                    if str(item.get("access_token") or item.get("token") or "").strip() not in terminal_set
+                ]
+
+        return {
+            **result,
+            "removed": removed,
+            "errors": _sanitize_account_errors(errors),
+            "items": _sanitize_accounts(account_service.list_accounts()),
+        }
+
+    @router.post("/api/accounts/recover")
+    async def recover_accounts(body: AccountRecoverRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        if not access_tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+
+        accounts_by_token = {
+            str(item.get("access_token") or "").strip(): item
+            for item in account_service.list_accounts()
+            if str(item.get("access_token") or "").strip()
+        }
+        registered_records = register_service.registered_accounts()
+        records_by_email = {
+            str(item.get("email") or "").strip().lower(): item
+            for item in registered_records
+            if str(item.get("email") or "").strip()
+        }
+        records_by_token = {
+            str(item.get("access_token") or "").strip(): item
+            for item in registered_records
+            if str(item.get("access_token") or "").strip()
+        }
+
+        target_emails: list[str] = []
+        errors: list[dict] = []
+        seen: set[str] = set()
+        for access_token in access_tokens:
+            account = accounts_by_token.get(access_token)
+            if account is None:
+                errors.append({"token": access_token, "error": "账号不存在"})
+                continue
+            login = account.get("login") if isinstance(account.get("login"), dict) else {}
+            email = str(account.get("email") or login.get("email") or "").strip().lower()
+            last_error = str(account.get("last_error") or "").strip()
+            if register_service.is_terminal_account_error(last_error):
+                errors.append(_terminal_recovery_error(
+                    access_token,
+                    email,
+                    "账号已被远端删除或停用，无法通过验证码或重新登录恢复",
+                ))
+                continue
+            if _is_sub2api_owned_account(account):
+                errors.append({"token": access_token, "email": email, "error": "sub2api 来源账号不由 chatgpt2api 重新登录恢复"})
+                continue
+            if str(account.get("status") or "").strip() != "异常":
+                errors.append({"token": access_token, "email": email, "error": "账号未标记异常，先刷新确认失败后再恢复"})
+                continue
+            if not _is_recoverable_auth_error(last_error):
+                errors.append({"token": access_token, "email": email, "error": "当前异常不是认证失败或 refresh 失败，不触发重新登录恢复"})
+                continue
+            record = records_by_token.get(access_token) or records_by_email.get(email)
+            if record is None:
+                errors.append({"token": access_token, "email": email, "error": "没有匹配的注册记录，无法自动重新登录"})
+                continue
+            record_email = str(record.get("email") or "").strip().lower()
+            if not record_email:
+                errors.append({"token": access_token, "email": email, "error": "注册记录缺少邮箱"})
+                continue
+            if not str(record.get("password") or "").strip():
+                errors.append({"token": access_token, "email": record_email, "error": "注册记录缺少密码，无法自动重新登录"})
+                continue
+            if record_email not in seen:
+                seen.add(record_email)
+                target_emails.append(record_email)
+
+        recovered = 0
+        if target_emails:
+            result = await run_in_threadpool(
+                lambda: register_service.recover_registered_accounts(target_emails, force=True)
+            )
+            recovered = int(result.get("recovered") or 0)
+            errors.extend(result.get("errors") or [])
+            for email in target_emails:
+                await run_in_threadpool(lambda value=email: register_service.sync_registered_account_to_local_pool(value))
+            terminal_emails = {
+                str(item.get("email") or "").strip().lower()
+                for item in errors
+                if isinstance(item, dict) and register_service.is_terminal_account_error(str(item.get("error") or ""))
+            }
+            token_by_email = {
+                _account_email(account): token
+                for token, account in accounts_by_token.items()
+                if _account_email(account)
+            }
+            for item in errors:
+                if not isinstance(item, dict):
+                    continue
+                if not item.get("manual_code_required"):
+                    continue
+                email = str(item.get("email") or "").strip().lower()
+                token = token_by_email.get(email, "")
+                if token:
+                    item["delete_token"] = token
+            if terminal_emails:
+                for token, account in accounts_by_token.items():
+                    if _account_email(account) in terminal_emails:
+                        account_service.update_account(
+                            token,
+                            {
+                                "status": "异常",
+                                "quota": 0,
+                                "last_error": "账号已被远端删除或停用，无法通过验证码或重新登录恢复",
+                            },
+                        )
+                for item in errors:
+                    if not isinstance(item, dict):
+                        continue
+                    email = str(item.get("email") or "").strip().lower()
+                    if email not in terminal_emails:
+                        continue
+                    for token, account in accounts_by_token.items():
+                        if _account_email(account) == email:
+                            item["access_token"] = token
+                            item["delete_token"] = token
+                            item["terminal"] = True
+                            item["terminal_action"] = "delete_local_pool"
+                            break
+        return {
+            "recovered": recovered,
+            "errors": _sanitize_account_errors(errors),
+            "items": _sanitize_accounts(account_service.list_accounts()),
+        }
+
+    @router.post("/api/accounts/backfill-oauth")
+    async def backfill_oauth_metadata(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        result = account_service.backfill_oauth_metadata(access_tokens or None, allow_remote=True)
         return {**result, "items": _sanitize_accounts(result.get("items", []))}
 
     @router.post("/api/accounts/update")

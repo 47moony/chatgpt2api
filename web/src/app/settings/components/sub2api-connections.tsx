@@ -74,6 +74,8 @@ function normalizeAccounts(items: Sub2APIRemoteAccount[]) {
       status: String(item.status || "").trim(),
       expires_at: String(item.expires_at || "").trim(),
       has_refresh_token: Boolean(item.has_refresh_token),
+      proxy_id: String(item.proxy_id || "").trim(),
+      has_proxy: Boolean(item.has_proxy),
     });
   }
   return accounts;
@@ -541,8 +543,8 @@ export function Sub2APIConnections() {
             <ul className="mt-1 list-inside list-disc space-y-0.5">
               <li>输入 Sub2API 地址和管理员账户（或 Admin API Key），保存为一个连接。</li>
               <li>点击某个连接的「同步」会拉取其中 platform=openai 且 type=oauth 的账号列表。</li>
-              <li>勾选需要的账号后后端会并发拉取 access_token，自动导入本地号池并刷新状态。</li>
-              <li>仅会读取 sub2api 凭据中的 access_token；refresh_token 等字段不会写入本地。</li>
+              <li>勾选需要的账号后后端会并发拉取 access_token，并尽量保留该账号绑定的代理。</li>
+              <li>仅会读取 sub2api 凭据中的 access_token；refresh_token 等字段不会写入本地，也不会在导入后立刻刷新远端信息。</li>
             </ul>
           </div>
         </CardContent>
@@ -818,6 +820,11 @@ export function Sub2APIConnections() {
                               className="rounded-md"
                             >
                               {item.status}
+                            </Badge>
+                          ) : null}
+                          {item.has_proxy ? (
+                            <Badge variant="secondary" className="rounded-md">
+                              代理
                             </Badge>
                           ) : null}
                         </div>

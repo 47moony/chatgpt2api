@@ -8,11 +8,19 @@ from urllib.parse import urlparse
 from curl_cffi.requests import Session
 
 from services.config import config
+from services.proxy_pool_service import proxy_by_key, proxy_url
 
 
 class ProxySettingsStore:
-    def build_session_kwargs(self, **session_kwargs) -> dict[str, object]:
-        proxy = config.get_proxy_settings()
+    def build_session_kwargs(self, account: dict | None = None, **session_kwargs) -> dict[str, object]:
+        proxy = ""
+        if isinstance(account, dict):
+            account_proxy = account.get("proxy") if isinstance(account.get("proxy"), dict) else None
+            proxy = proxy_url(account_proxy) if account_proxy else ""
+            if not proxy:
+                proxy_ref = proxy_by_key(str(account.get("proxy_key") or ""))
+                proxy = proxy_url(proxy_ref) if proxy_ref else ""
+        proxy = proxy or config.get_proxy_settings()
         if proxy:
             session_kwargs["proxy"] = proxy
         return session_kwargs

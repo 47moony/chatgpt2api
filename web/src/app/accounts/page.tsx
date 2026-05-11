@@ -11,6 +11,7 @@ import {
   CircleOff,
   Copy,
   Download,
+  KeyRound,
   LoaderCircle,
   Pencil,
   RefreshCw,
@@ -42,11 +43,11 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
-  downloadSub2APIExport,
   fetchAccounts,
-  getSub2APIAccountsExportUrl,
+  recoverAccounts,
   refreshAccounts,
   updateAccount,
+  completeManualRegisteredAccountRecovery,
   type Account,
   type AccountStatus,
 } from "@/lib/api";
@@ -166,6 +167,140 @@ function displayAccountType(account: Account) {
   return account.type || "Free";
 }
 
+function displayProxy(account: Account) {
+  const proxy = account.proxy;
+  if (proxy?.name) return proxy.name;
+  if (proxy?.host && proxy?.port) return `${proxy.host}:${proxy.port}`;
+  return account.proxy_key || "—";
+}
+
+function sourceMeta(account: Account): {
+  label: string;
+  detail: string;
+  badge: ComponentProps<typeof Badge>["variant"];
+} {
+  const owner = String(account.credential_owner || "").trim();
+  if (owner === "sub2api" || account.sub2api_account_id) {
+    return {
+      label: "sub2api",
+      detail: account.sub2api_account_id ? `ID ${account.sub2api_account_id}` : "refresh 由 sub2api 管理",
+      badge: "violet",
+    };
+  }
+  if (owner === "chatgpt2api" || account.register_job_id) {
+    return {
+      label: "注册机",
+      detail: account.register_job_id ? `任务 ${account.register_job_id.slice(0, 8)}` : "chat 本地管理",
+      badge: "info",
+    };
+  }
+  if (owner) {
+    return { label: owner, detail: "自定义来源", badge: "secondary" };
+  }
+  return { label: "手动 Token", detail: "无本地 refresh 管理", badge: "secondary" };
+}
+
+function accountEmail(account: Account) {
+  return account.email || account.login?.email || "";
+}
+
+function isSub2APIOwnedAccount(account: Account) {
+  return String(account.credential_owner || "").trim() === "sub2api" || Boolean(account.sub2api_account_id);
+}
+
+function isTerminalAccount(account: Account) {
+  const text = String(account.last_error || "").toLowerCase();
+  return text.includes("deleted or deactivated") || text.includes("远端删除") || text.includes("停用");
+}
+
+function isRecoverableAuthError(account: Account) {
+  const text = String(account.last_error || "").toLowerCase();
+  if (isTerminalAccount(account)) {
+    return false;
+  }
+  const networkMarkers = [
+    "tls",
+    "ssl",
+    "timed out",
+    "timeout",
+    "connection",
+    "proxy",
+    "temporarily unavailable",
+    "remote end closed",
+    "curl",
+  ];
+  if (networkMarkers.some((marker) => text.includes(marker))) {
+    return false;
+  }
+  const authMarkers = [
+    "401",
+    "unauthorized",
+    "token_invalidated",
+    "authentication token has been invalidated",
+    "invalid access token",
+    "invalid_access_token",
+    "refresh failed",
+    "refresh token unavailable",
+    "refresh_token_http_400",
+    "refresh_token_http_401",
+    "refresh_token_http_403",
+    "refresh_token_missing_access_token",
+    "refresh_token_missing_client_id",
+  ];
+  return authMarkers.some((marker) => text.includes(marker));
+}
+
+function canRecoverAccount(account: Account) {
+  return (
+    account.status === "异常" &&
+    Boolean(accountEmail(account)) &&
+    !isSub2APIOwnedAccount(account) &&
+    isRecoverableAuthError(account)
+  );
+}
+
+function isTerminalRecoverError(item: RecoverDialogState["errors"][number]) {
+  const text = String(item.error || "").toLowerCase();
+  return Boolean(item.terminal) || text.includes("deleted or deactivated") || text.includes("远端删除") || text.includes("停用");
+}
+
+function recoverDisableReason(account: Account) {
+  if (account.status !== "异常") return "账号未标记异常";
+  if (!accountEmail(account)) return "缺少邮箱";
+  if (isSub2APIOwnedAccount(account)) return "sub2api 来源账号不由 chatgpt2api 恢复";
+  if (isTerminalAccount(account)) return "远端已删除或停用";
+  if (!isRecoverableAuthError(account)) return "当前异常不是认证失败或 refresh 失败";
+  return "重新登录恢复凭据";
+}
+
+type RecoverDialogState = {
+  open: boolean;
+  status: "running" | "done" | "error";
+  requested: number;
+  recovered: number;
+  errors: Array<{
+    token?: string;
+    delete_token?: string;
+    email?: string;
+    error: string;
+    manual_code_required?: boolean;
+    session_id?: string;
+    api_base?: string;
+    mailbox?: Record<string, unknown>;
+    terminal?: boolean;
+    terminal_action?: string;
+  }>;
+  message?: string;
+};
+
+type ManualRecoveryState = {
+  sessionId: string;
+  email?: string;
+  apiBase?: string;
+  code: string;
+  deleteToken?: string;
+};
+
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -179,8 +314,11 @@ function AccountsPageContent() {
   const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isRecovering, setIsRecovering] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
+  const [recoverDialog, setRecoverDialog] = useState<RecoverDialogState | null>(null);
+  const [manualRecovery, setManualRecovery] = useState<ManualRecoveryState | null>(null);
 
   const loadAccounts = async (silent = false) => {
     if (!silent) {
@@ -254,6 +392,17 @@ function AccountsPageContent() {
     return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
   }, [accounts]);
 
+  const recoverableAbnormalTokens = useMemo(() => {
+    return accounts
+      .filter(canRecoverAccount)
+      .map((item) => item.access_token);
+  }, [accounts]);
+
+  const selectedRecoverableTokens = useMemo(() => {
+    const recoverableSet = new Set(recoverableAbnormalTokens);
+    return selectedTokens.filter((token) => recoverableSet.has(token));
+  }, [recoverableAbnormalTokens, selectedTokens]);
+
   const paginationItems = useMemo(() => {
     const items: (number | "...")[] = [];
     const start = Math.max(1, safePage - 1);
@@ -267,19 +416,6 @@ function AccountsPageContent() {
 
     return items;
   }, [pageCount, safePage]);
-
-  const handleExportSub2API = async (proxy: boolean) => {
-    try {
-      await downloadSub2APIExport(
-        getSub2APIAccountsExportUrl(proxy),
-        `sub2api-accounts-${proxy ? "with-proxy" : "no-proxy"}.json`,
-      );
-      toast.success(proxy ? "已导出 sub2api JSON（自动分配代理）" : "已导出 sub2api JSON");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "导出 sub2api JSON 失败";
-      toast.error(message);
-    }
-  };
 
   const handleDeleteTokens = async (tokens: string[]) => {
     if (tokens.length === 0) {
@@ -301,6 +437,39 @@ function AccountsPageContent() {
     }
   };
 
+  const handleDeleteRecoverError = async (item: RecoverDialogState["errors"][number]) => {
+    const token = String(item.delete_token || "").trim();
+    if (!token) {
+      toast.error("缺少可删除的本地池 token");
+      return;
+    }
+
+    setIsDeleting(true);
+    try {
+      const data = await deleteAccounts([token]);
+      setAccounts(data.items);
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((account) => account.access_token === id)));
+      setRecoverDialog((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        return {
+          ...prev,
+          errors: prev.errors.filter((errorItem) => errorItem !== item),
+        };
+      });
+      if (manualRecovery?.deleteToken === token) {
+        setManualRecovery(null);
+      }
+      toast.success(`删除 ${data.removed ?? 0} 个账户`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "删除账户失败";
+      toast.error(message);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   const handleRefreshAccounts = async (accessTokens: string[]) => {
     if (accessTokens.length === 0) {
       toast.error("没有需要刷新的账户");
@@ -312,19 +481,120 @@ function AccountsPageContent() {
       const data = await refreshAccounts(accessTokens);
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      const extra = [
+        data.removed ? `删除失效 ${data.removed} 个` : "",
+      ].filter(Boolean).join("，");
       if (data.errors.length > 0) {
         const firstError = data.errors[0]?.error;
         toast.error(
-          `刷新成功 ${data.refreshed} 个，失败 ${data.errors.length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+          `刷新成功 ${data.refreshed} 个${extra ? `，${extra}` : ""}，失败 ${data.errors.length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
         );
       } else {
-        toast.success(`刷新成功 ${data.refreshed} 个账户`);
+        toast.success(`刷新成功 ${data.refreshed} 个账户${extra ? `，${extra}` : ""}`);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "刷新账户失败";
       toast.error(message);
     } finally {
       setIsRefreshing(false);
+    }
+  };
+
+  const handleRecoverAccounts = async (accessTokens: string[]) => {
+    const recoverableSet = new Set(accounts.filter(canRecoverAccount).map((item) => item.access_token));
+    const targetTokens = accessTokens.filter((token) => recoverableSet.has(token));
+    if (targetTokens.length === 0) {
+      toast.error("没有可恢复的账户");
+      return;
+    }
+
+    setIsRecovering(true);
+    setRecoverDialog({
+      open: true,
+      status: "running",
+      requested: targetTokens.length,
+      recovered: 0,
+      errors: [],
+    });
+    try {
+      const data = await recoverAccounts(targetTokens);
+      setAccounts(data.items);
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setRecoverDialog({
+        open: true,
+        status: "done",
+        requested: targetTokens.length,
+        recovered: data.recovered,
+        errors: data.errors,
+      });
+      const manualError = data.errors.find((item) => item.manual_code_required && item.session_id);
+      if (manualError?.session_id) {
+        setManualRecovery({
+          sessionId: manualError.session_id,
+          email: manualError.email,
+          apiBase: manualError.api_base,
+          code: "",
+          deleteToken: manualError.delete_token,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "恢复账户失败";
+      setRecoverDialog({
+        open: true,
+        status: "error",
+        requested: targetTokens.length,
+        recovered: 0,
+        errors: [],
+        message,
+      });
+    } finally {
+      setIsRecovering(false);
+    }
+  };
+
+  const handleCompleteManualRecovery = async () => {
+    if (!manualRecovery) {
+      return;
+    }
+
+    setIsRecovering(true);
+    try {
+      const result = await completeManualRegisteredAccountRecovery(manualRecovery.sessionId, manualRecovery.code);
+      if (result.status === "complete") {
+        setManualRecovery(null);
+        await loadAccounts(true);
+        setRecoverDialog((prev) => prev ? { ...prev, recovered: prev.recovered + Number(result.recovered || 1) } : prev);
+        toast.success("验证码恢复完成");
+        return;
+      }
+      await loadAccounts(true);
+      const errorText = result.error || "手动验证码恢复失败";
+      const terminal = isTerminalRecoverError({ error: errorText });
+      setRecoverDialog((prev) => {
+        const errorItem = {
+          email: result.email || manualRecovery.email,
+          error: errorText,
+          terminal,
+          delete_token: terminal ? manualRecovery.deleteToken : undefined,
+          terminal_action: terminal ? "delete_local_pool" : undefined,
+        };
+        if (!prev) {
+          return {
+            open: true,
+            status: "done",
+            requested: 1,
+            recovered: 0,
+            errors: [errorItem],
+          };
+        }
+        return { ...prev, errors: [...prev.errors, errorItem] };
+      });
+      toast.error(errorText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "手动验证码恢复失败";
+      toast.error(message);
+    } finally {
+      setIsRecovering(false);
     }
   };
 
@@ -381,7 +651,7 @@ function AccountsPageContent() {
             disabled={isLoading || isRefreshing || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
-            刷新
+            刷新列表
           </Button>
           <Button
             variant="outline"
@@ -408,24 +678,6 @@ function AccountsPageContent() {
           >
             <Download className="size-4" />
             导出全部 Token
-          </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleExportSub2API(false)}
-            disabled={accounts.length === 0}
-          >
-            <Download className="size-4" />
-            导出 sub2api
-          </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleExportSub2API(true)}
-            disabled={accounts.length === 0}
-          >
-            <Download className="size-4" />
-            sub2api+代理
           </Button>
         </div>
       </section>
@@ -473,6 +725,161 @@ function AccountsPageContent() {
             >
               {isUpdating ? <LoaderCircle className="size-4 animate-spin" /> : null}
               保存修改
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(recoverDialog?.open)}
+        onOpenChange={(open) => {
+          if (isRecovering) {
+            return;
+          }
+          setRecoverDialog((prev) => (prev ? { ...prev, open } : prev));
+        }}
+      >
+        <DialogContent showCloseButton={!isRecovering} className="rounded-2xl p-6 sm:max-w-[560px]">
+          <DialogHeader className="gap-2">
+            <DialogTitle>恢复账号凭据</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              重新登录只会处理已标记异常且能匹配注册记录的账号。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid grid-cols-3 gap-3">
+              <div className="rounded-xl border border-stone-100 bg-stone-50 px-3 py-2">
+                <div className="text-xs text-stone-500">本次处理</div>
+                <div className="mt-1 text-lg font-semibold text-stone-900">
+                  {recoverDialog?.requested ?? 0}
+                </div>
+              </div>
+              <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2">
+                <div className="text-xs text-emerald-700">恢复成功</div>
+                <div className="mt-1 text-lg font-semibold text-emerald-700">
+                  {recoverDialog?.recovered ?? 0}
+                </div>
+              </div>
+              <div className="rounded-xl border border-rose-100 bg-rose-50 px-3 py-2">
+                <div className="text-xs text-rose-700">恢复失败</div>
+                <div className="mt-1 text-lg font-semibold text-rose-700">
+                  {recoverDialog?.errors.length ?? 0}
+                </div>
+              </div>
+            </div>
+
+            {recoverDialog?.status === "running" ? (
+              <div className="flex items-center gap-3 rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-700">
+                <LoaderCircle className="size-4 animate-spin" />
+                正在重新登录并换取凭据，完成后会保留结果明细。
+              </div>
+            ) : null}
+
+            {recoverDialog?.status === "error" ? (
+              <div className="rounded-xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm leading-6 text-rose-700">
+                {recoverDialog.message || "恢复账户失败"}
+              </div>
+            ) : null}
+
+            {recoverDialog?.status === "done" && recoverDialog.errors.length === 0 ? (
+              <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm leading-6 text-emerald-700">
+                本次恢复全部成功，账号列表已同步最新凭据。
+              </div>
+            ) : null}
+
+            {recoverDialog?.errors.length ? (
+              <div className="space-y-2">
+                <div className="text-sm font-medium text-stone-700">失败明细</div>
+                <div className="max-h-56 space-y-2 overflow-auto rounded-xl border border-stone-100 bg-stone-50 p-2">
+                  {recoverDialog.errors.map((item, index) => {
+                    const terminal = isTerminalRecoverError(item);
+                    return (
+                      <div key={`${item.email || item.token || index}`} className="rounded-lg bg-white px-3 py-2 text-sm leading-6">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="font-medium text-stone-700">
+                              {item.email || maskToken(item.token) || `账号 ${index + 1}`}
+                            </div>
+                            <div className="break-words text-rose-600">{item.error}</div>
+                            {terminal ? (
+                              <div className="mt-1 text-xs text-stone-500">
+                                远端已返回删除或停用，不能通过验证码恢复。
+                              </div>
+                            ) : null}
+                          </div>
+                          {terminal ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 shrink-0 rounded-lg border-rose-200 bg-white px-3 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
+                              onClick={() => void handleDeleteRecoverError(item)}
+                              disabled={isDeleting || !item.delete_token}
+                            >
+                              {isDeleting ? <LoaderCircle className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                              删除本地池
+                            </Button>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter className="pt-2">
+            <Button
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              onClick={() => setRecoverDialog((prev) => (prev ? { ...prev, open: false } : prev))}
+              disabled={isRecovering}
+            >
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(manualRecovery)} onOpenChange={(open) => (!open ? setManualRecovery(null) : null)}>
+        <DialogContent showCloseButton={false} className="rounded-2xl p-6 sm:max-w-[460px]">
+          <DialogHeader className="gap-2">
+            <DialogTitle>手动验证码恢复</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              已触发 {manualRecovery?.email || "该账号"} 的登录验证码，输入邮箱收到的 6 位验证码后继续换取凭据。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-stone-100 bg-stone-50 px-3 py-2 text-sm leading-6 text-stone-600">
+            API Base：<span className="font-mono">{manualRecovery?.apiBase || "-"}</span>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-stone-700">邮箱验证码</label>
+            <Input
+              value={manualRecovery?.code || ""}
+              onChange={(event) => {
+                const value = event.target.value.replace(/\D/g, "").slice(0, 6);
+                setManualRecovery((prev) => (prev ? { ...prev, code: value } : prev));
+              }}
+              placeholder="6 位验证码"
+              className="h-11 rounded-xl border-stone-200 bg-white font-mono text-lg tracking-[0.3em]"
+            />
+          </div>
+          <DialogFooter className="pt-2">
+            <Button
+              type="button"
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => setManualRecovery(null)}
+              disabled={isRecovering}
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              onClick={() => void handleCompleteManualRecovery()}
+              disabled={isRecovering || (manualRecovery?.code.length || 0) !== 6}
+            >
+              {isRecovering ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              提交验证码
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -590,10 +997,19 @@ function AccountsPageContent() {
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
                   onClick={() => void handleRefreshAccounts(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isRefreshing}
+                  disabled={selectedTokens.length === 0 || isRefreshing || isRecovering}
                 >
                   {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                   刷新选中账号信息和额度
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-blue-600 hover:bg-blue-50 hover:text-blue-700"
+                  onClick={() => void handleRecoverAccounts(selectedRecoverableTokens)}
+                  disabled={selectedRecoverableTokens.length === 0 || isRecovering}
+                >
+                  {isRecovering ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+                  恢复选中异常账号
                 </Button>
                 <Button
                   variant="ghost"
@@ -622,7 +1038,7 @@ function AccountsPageContent() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left">
+              <table className="w-full min-w-[1240px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
@@ -634,7 +1050,9 @@ function AccountsPageContent() {
                     <th className="w-56 px-4 py-3">token</th>
                     <th className="w-28 px-4 py-3">类型</th>
                     <th className="w-24 px-4 py-3">状态</th>
-                    <th className="w-56 px-4 py-3">账号信息</th>
+                    <th className="w-36 px-4 py-3">来源</th>
+                    <th className="w-64 px-4 py-3">账号信息</th>
+                    <th className="w-44 px-4 py-3">当前代理</th>
                     <th className="w-24 px-4 py-3">额度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
                     <th className="w-18 px-4 py-3">成功</th>
@@ -644,8 +1062,10 @@ function AccountsPageContent() {
                 </thead>
                 <tbody>
                   {currentRows.map((account) => {
-                    const status = statusMeta[account.status];
+                    const terminalAccount = isTerminalAccount(account);
+                    const status = terminalAccount ? statusMeta["异常"] : statusMeta[account.status];
                     const StatusIcon = status.icon;
+                    const source = sourceMeta(account);
 
                     return (
                       <tr
@@ -692,11 +1112,50 @@ function AccountsPageContent() {
                             className="inline-flex items-center gap-1 rounded-md px-2 py-1"
                           >
                             <StatusIcon className="size-3.5" />
-                            {account.status}
+                            {terminalAccount ? "远端停用" : account.status}
                           </Badge>
+                          {terminalAccount ? (
+                            <div className="mt-1 max-w-[120px] truncate text-xs text-rose-500" title={account.last_error || ""}>
+                              不可恢复
+                            </div>
+                          ) : null}
                         </td>
                         <td className="px-4 py-3">
-                          <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                          <div className="space-y-1">
+                            <Badge variant={source.badge} className="rounded-md">
+                              {source.label}
+                            </Badge>
+                            <div className="max-w-[150px] truncate text-xs leading-5 text-stone-500" title={source.detail}>
+                              {source.detail}
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const loginEmail = account.login?.email || account.email || "";
+                            return (
+                              <div className="space-y-1 text-xs leading-5 text-stone-500">
+                                <div className="flex items-center gap-1">
+                                  <span>{loginEmail || "—"}</span>
+                                  {loginEmail ? (
+                                    <button
+                                      type="button"
+                                      className="rounded p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                                      onClick={() => {
+                                        void navigator.clipboard.writeText(loginEmail);
+                                        toast.success("邮箱已复制");
+                                      }}
+                                    >
+                                      <Copy className="size-3.5" />
+                                    </button>
+                                  ) : null}
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </td>
+                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
+                          {displayProxy(account)}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">
@@ -730,9 +1189,19 @@ function AccountsPageContent() {
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => void handleRefreshAccounts([account.access_token])}
-                              disabled={isRefreshing}
+                              disabled={isRefreshing || isRecovering}
+                              title="刷新账号信息和额度"
                             >
                               <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-blue-50 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-40"
+                              onClick={() => void handleRecoverAccounts([account.access_token])}
+                              disabled={isRecovering || !canRecoverAccount(account)}
+                              title={recoverDisableReason(account)}
+                            >
+                              {isRecovering ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
                             </button>
                             <button
                               type="button"

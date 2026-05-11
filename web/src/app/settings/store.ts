@@ -4,12 +4,18 @@ import { create } from "zustand";
 import { toast } from "sonner";
 
 import {
+  backfillRegisteredAccountsMailMetadata,
   createCPAPool,
+  completeManualRegisteredAccountRecovery as completeManualRegisteredAccountRecoveryApi,
   deleteBackup,
   deleteCPAPool,
+  deleteRegisteredAccounts as deleteRegisteredAccountsApi,
   fetchCPAPoolFiles,
   fetchCPAPools,
   fetchBackups,
+  importRegisteredAccountsToLocalPool as importRegisteredAccountsToLocalPoolApi,
+  recoverRegisteredAccounts as recoverRegisteredAccountsApi,
+  startManualRegisteredAccountRecovery as startManualRegisteredAccountRecoveryApi,
   fetchRegisterConfig,
   resetRegister as resetRegisterApi,
   fetchSettingsConfig,
@@ -193,10 +199,29 @@ type SettingsStore = {
   setRegisterTargetQuota: (value: string) => void;
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
+  setRegisterAddToLocalPool: (value: boolean) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
   deleteRegisterProvider: (index: number) => void;
+  deleteRegisteredAccounts: (emails: string[]) => Promise<number>;
+  backfillRegisteredMailMetadata: () => Promise<number>;
+  recoverRegisteredAccounts: (emails: string[]) => Promise<{
+    recovered: number;
+    errors: Array<{
+      email: string;
+      error: string;
+      manual_code_required?: boolean;
+      status?: string;
+      session_id?: string;
+      api_base?: string;
+      expires_in?: number;
+      mailbox?: Record<string, unknown>;
+    }>;
+  }>;
+  startManualRegisteredAccountRecovery: (email: string) => Promise<{ status: string; session_id?: string; email?: string; api_base?: string; error?: string } | null>;
+  completeManualRegisteredAccountRecovery: (sessionId: string, code: string) => Promise<boolean>;
+  importRegisteredAccountsToLocalPool: (emails: string[]) => Promise<number>;
   saveRegister: () => Promise<void>;
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
@@ -574,6 +599,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, check_interval: Number(value) || 0 } } : {});
   },
 
+  setRegisterAddToLocalPool: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, add_to_local_pool: value } } : {});
+  },
+
   setRegisterMailField: (key, value) => {
     set((state) => state.registerConfig ? {
       registerConfig: {
@@ -619,6 +648,176 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     } : {});
   },
 
+  deleteRegisteredAccounts: async (emails) => {
+    const normalizedEmails = Array.from(
+      new Set(emails.map((email) => String(email || "").trim()).filter(Boolean)),
+    );
+    if (normalizedEmails.length === 0) {
+      toast.error("请先选择要删除的已注册号码");
+      return 0;
+    }
+    set({ isSavingRegister: true });
+    try {
+      const data = await deleteRegisteredAccountsApi(normalizedEmails);
+      set({ registerConfig: data.register });
+      toast.success(`已删除 ${data.removed} 个已注册号码`);
+      return data.removed;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "删除已注册号码失败");
+      return 0;
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  backfillRegisteredMailMetadata: async () => {
+    set({ isSavingRegister: true });
+    try {
+      const data = await backfillRegisteredAccountsMailMetadata();
+      set({ registerConfig: data.register });
+      toast.success(`已回填 ${data.updated} 个已注册号码的邮箱元数据`);
+      return data.updated;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "回填邮箱元数据失败");
+      return 0;
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  recoverRegisteredAccounts: async (emails) => {
+    const normalizedEmails = Array.from(
+      new Set(emails.map((email) => String(email || "").trim()).filter(Boolean)),
+    );
+    if (normalizedEmails.length === 0) {
+      toast.error("请先选择要恢复的已注册号码");
+      return { recovered: 0, errors: [] };
+    }
+    set({ isSavingRegister: true });
+    try {
+      const data = await recoverRegisteredAccountsApi(normalizedEmails);
+      set((state) => {
+        const current = state.registerConfig;
+        if (!current) {
+          return { registerConfig: data.register };
+        }
+        const targets = new Set(normalizedEmails.map((email) => email.toLowerCase()));
+        const recoveredByEmail = new Map(
+          (data.register.registered_accounts || [])
+            .filter((account) => targets.has(String(account.email || "").toLowerCase()))
+            .map((account) => [String(account.email || "").toLowerCase(), account]),
+        );
+        return {
+          registerConfig: {
+            ...current,
+            stats: data.register.stats,
+            logs: data.register.logs,
+            registered_accounts: (current.registered_accounts || []).map((account) => {
+              const email = String(account.email || "").toLowerCase();
+              const nextAccount = recoveredByEmail.get(email);
+              return nextAccount ? { ...account, ...nextAccount } : account;
+            }),
+          },
+        };
+      });
+      const visibleErrors = data.errors.filter((item) => !item.manual_code_required);
+      if (visibleErrors.length > 0) {
+        const first = visibleErrors[0];
+        toast.error(`恢复成功 ${data.recovered} 个，失败 ${visibleErrors.length} 个${first ? `，首个错误：${first.error}` : ""}`);
+      } else if (data.errors.some((item) => item.manual_code_required)) {
+        toast.success("验证码已触发，请输入邮箱收到的 6 位验证码");
+      } else {
+        toast.success(`已恢复 ${data.recovered} 个已注册号码`);
+      }
+      return { recovered: data.recovered, errors: data.errors };
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "恢复已注册号码失败");
+      return { recovered: 0, errors: [] };
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  startManualRegisteredAccountRecovery: async (email) => {
+    const normalizedEmail = String(email || "").trim();
+    if (!normalizedEmail) {
+      toast.error("缺少要恢复的邮箱");
+      return null;
+    }
+    set({ isSavingRegister: true });
+    try {
+      const data = await startManualRegisteredAccountRecoveryApi(normalizedEmail);
+      if (data.register) {
+        set({ registerConfig: data.register });
+      }
+      if (data.status === "complete") {
+        toast.success("已恢复 1 个已注册号码");
+        return data;
+      }
+      if (data.status === "manual_code_required") {
+        toast.success("验证码已触发，请输入邮箱收到的 6 位验证码");
+        return data;
+      }
+      toast.error(data.error || "启动手动验证码恢复失败");
+      return data;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "启动手动验证码恢复失败");
+      return null;
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  completeManualRegisteredAccountRecovery: async (sessionId, code) => {
+    const normalizedSessionId = String(sessionId || "").trim();
+    const normalizedCode = String(code || "").trim();
+    if (!normalizedSessionId || !normalizedCode) {
+      toast.error("缺少恢复会话或验证码");
+      return false;
+    }
+    set({ isSavingRegister: true });
+    try {
+      const data = await completeManualRegisteredAccountRecoveryApi(normalizedSessionId, normalizedCode);
+      if (data.register) {
+        set({ registerConfig: data.register });
+      }
+      if (data.status === "complete") {
+        toast.success("手动验证码恢复成功");
+        return true;
+      }
+      toast.error(data.error || "手动验证码恢复失败");
+      return false;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "手动验证码恢复失败");
+      return false;
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  importRegisteredAccountsToLocalPool: async (emails) => {
+    const normalizedEmails = Array.from(
+      new Set(emails.map((email) => String(email || "").trim()).filter(Boolean)),
+    );
+    set({ isSavingRegister: true });
+    try {
+      const data = await importRegisteredAccountsToLocalPoolApi(normalizedEmails);
+      set({ registerConfig: data.register });
+      if (data.errors.length > 0) {
+        const first = data.errors[0];
+        toast.error(`导入成功 ${data.imported} 个，跳过 ${data.skipped} 个${first ? `，首个错误：${first.error}` : ""}`);
+      } else {
+        toast.success(`已导入 ${data.imported} 个账号到本地号池`);
+      }
+      return data.imported;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "导入本地号池失败");
+      return 0;
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
   saveRegister: async () => {
     const { registerConfig } = get();
     if (!registerConfig) return;
@@ -633,6 +832,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
         check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+        add_to_local_pool: Boolean(registerConfig.add_to_local_pool),
       });
       set({ registerConfig: data.register });
       toast.success("注册配置已保存");
@@ -658,6 +858,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),
           check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+          add_to_local_pool: Boolean(registerConfig.add_to_local_pool),
         });
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();

@@ -52,7 +52,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", account: Optional[dict] = None) -> None:
         """初始化后端客户端。
 
         参数：
@@ -62,13 +62,17 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
+        self._account_override = account if isinstance(account, dict) else None
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
+        account = self._account_override or (account_service.get_account(self.access_token) if self.access_token else {})
+        account = account if isinstance(account, dict) else {}
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=account,
             impersonate=self.fp["impersonate"],
             verify=True,
         ))
@@ -102,7 +106,7 @@ class OpenAIBackendAPI:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
     def _build_fp(self) -> Dict[str, str]:
-        account = account_service.get_account(self.access_token) if self.access_token else {}
+        account = self._account_override or (account_service.get_account(self.access_token) if self.access_token else {})
         account = account if isinstance(account, dict) else {}
         raw_fp = account.get("fp")
         fp = {str(k).lower(): str(v) for k, v in raw_fp.items()} if isinstance(raw_fp, dict) else {}
@@ -185,7 +189,57 @@ class OpenAIBackendAPI:
             raise RuntimeError(f"/backend-api/accounts/check failed: HTTP {response.status_code}")
         payload = response.json()
         logger.debug({"event": "backend_user_info_account_payload", "account_payload": payload})
-        return ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
+        return self._extract_default_account(payload)
+
+    @staticmethod
+    def _account_id_from_account_container(container: Dict[str, Any]) -> str:
+        account = container.get("account") if isinstance(container.get("account"), dict) else container
+        if not isinstance(account, dict):
+            return ""
+        return str(
+            account.get("id")
+            or account.get("account_id")
+            or account.get("chatgpt_account_id")
+            or account.get("accountId")
+            or ""
+        ).strip()
+
+    @classmethod
+    def _extract_default_account(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        accounts = payload.get("accounts") if isinstance(payload, dict) else {}
+        if not isinstance(accounts, dict):
+            return {}
+
+        default = accounts.get("default")
+        if isinstance(default, dict):
+            default_account = default.get("account") if isinstance(default.get("account"), dict) else default
+            if cls._account_id_from_account_container(default):
+                return default_account
+
+        candidates: list[Dict[str, Any]] = []
+        for value in accounts.values():
+            if not isinstance(value, dict):
+                continue
+            account = value.get("account") if isinstance(value.get("account"), dict) else value
+            if isinstance(account, dict):
+                candidates.append(value)
+
+        for candidate in candidates:
+            account = candidate.get("account") if isinstance(candidate.get("account"), dict) else candidate
+            if bool(account.get("is_default")) and cls._account_id_from_account_container(candidate):
+                return account
+
+        for candidate in candidates:
+            account = candidate.get("account") if isinstance(candidate.get("account"), dict) else candidate
+            plan_type = str(account.get("plan_type") or "").strip().lower()
+            if plan_type and plan_type != "free" and cls._account_id_from_account_container(candidate):
+                return account
+
+        for candidate in candidates:
+            account = candidate.get("account") if isinstance(candidate.get("account"), dict) else candidate
+            if cls._account_id_from_account_container(candidate):
+                return account
+        return {}
 
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
@@ -203,6 +257,7 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        account_id = str(default_account.get("id") or default_account.get("account_id") or default_account.get("chatgpt_account_id") or "").strip()
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
@@ -214,6 +269,8 @@ class OpenAIBackendAPI:
             "restore_at": restore_at,
             "status": "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常"),
         }
+        if account_id:
+            result["oauth"] = {"chatgpt_account_id": account_id}
         logger.debug({
             "event": "backend_user_info_result",
             "email": result.get("email"),

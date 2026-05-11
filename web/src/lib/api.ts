@@ -12,6 +12,21 @@ export type Account = {
   quota: number;
   image_quota_unknown?: boolean;
   email?: string | null;
+  login?: {
+    email?: string | null;
+  } | null;
+  credential_owner?: "chatgpt2api" | "sub2api" | string | null;
+  register_job_id?: string | null;
+  sub2api_account_id?: string | null;
+  proxy_key?: string | null;
+  proxy?: {
+    proxy_key?: string;
+    name?: string;
+    protocol?: string;
+    host?: string;
+    port?: number | string;
+    status?: string;
+  } | null;
   user_id?: string | null;
   limits_progress?: Array<{
     feature_name?: string;
@@ -23,6 +38,7 @@ export type Account = {
   success: number;
   fail: number;
   last_used_at?: string | null;
+  last_error?: string | null;
 };
 
 type AccountListResponse = {
@@ -41,7 +57,26 @@ type AccountMutationResponse = {
 type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
-  errors: Array<{ access_token: string; error: string }>;
+  removed?: number;
+  recovered?: number;
+  errors: Array<{ access_token?: string; token?: string; email?: string; error: string }>;
+};
+
+type AccountRecoverResponse = {
+  items: Account[];
+  recovered: number;
+  errors: Array<{
+    token?: string;
+    delete_token?: string;
+    email?: string;
+    error: string;
+    manual_code_required?: boolean;
+    session_id?: string;
+    api_base?: string;
+    mailbox?: Record<string, unknown>;
+    terminal?: boolean;
+    terminal_action?: string;
+  }>;
 };
 
 type AccountUpdateResponse = {
@@ -215,6 +250,7 @@ export type RegisterConfig = {
   target_quota: number;
   target_available: number;
   check_interval: number;
+  add_to_local_pool?: boolean;
   stats: {
     job_id?: string;
     success: number;
@@ -231,11 +267,57 @@ export type RegisterConfig = {
     updated_at?: string;
     finished_at?: string;
   };
+  registered_accounts?: Array<{
+    email: string;
+    password: string;
+    access_token?: string;
+    refresh_token?: string;
+    id_token?: string;
+    mail_provider?: string | null;
+    mail_provider_ref?: string | null;
+    created_at?: string;
+    job_id?: string | null;
+    proxy_key?: string | null;
+    proxy?: {
+      proxy_key?: string;
+      name?: string;
+      host?: string;
+      port?: string | number;
+      protocol?: string;
+    } | null;
+    recovered?: boolean;
+    auth_failed?: boolean;
+    error?: string;
+    mailbox?: Record<string, unknown> | null;
+    imported_to_local_pool?: boolean;
+    local_pool_status?: string;
+  }>;
   logs?: Array<{
     time: string;
     text: string;
     level: string;
   }>;
+};
+
+export type RegisterSub2APICheckItem = {
+  email: string;
+  ok: boolean;
+  exportable: boolean;
+  missing_fields: string[];
+  errors: string[];
+  warnings: string[];
+  access_token_expired: boolean;
+  access_token_expires_at?: string | null;
+  remote_status: "skipped" | "ok" | "invalid" | "error" | string;
+  remote_error?: string;
+};
+
+export type RegisterSub2APICheck = {
+  total: number;
+  ok: boolean;
+  blocking_count: number;
+  warning_count: number;
+  items: RegisterSub2APICheckItem[];
 };
 
 export async function login(authKey: string) {
@@ -275,6 +357,13 @@ export async function refreshAccounts(accessTokens: string[]) {
   });
 }
 
+export async function recoverAccounts(accessTokens: string[]) {
+  return httpRequest<AccountRecoverResponse>("/api/accounts/recover", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+}
+
 export async function updateAccount(
   accessToken: string,
   updates: {
@@ -292,16 +381,20 @@ export async function updateAccount(
   });
 }
 
-export function getSub2APIAccountsExportUrl(proxy: boolean) {
+export function getSub2APIRegisterExportUrl(proxy: boolean, emails: string[] = []) {
   const params = new URLSearchParams();
   if (proxy) params.set("proxy", "true");
-  return `/api/accounts/export/sub2api${params.toString() ? `?${params.toString()}` : ""}`;
+  if (emails.length > 0) params.set("emails", emails.join(","));
+  return `/api/register/export/sub2api${params.toString() ? `?${params.toString()}` : ""}`;
 }
 
-export function getSub2APIRegisterExportUrl(proxy: boolean) {
+export async function checkRegisterSub2APIExport(emails: string[] = [], remote = true) {
   const params = new URLSearchParams();
-  if (proxy) params.set("proxy", "true");
-  return `/api/register/export/sub2api${params.toString() ? `?${params.toString()}` : ""}`;
+  if (emails.length > 0) params.set("emails", emails.join(","));
+  if (!remote) params.set("remote", "false");
+  return httpRequest<{ check: RegisterSub2APICheck }>(
+    `/api/register/check/sub2api${params.toString() ? `?${params.toString()}` : ""}`,
+  );
 }
 
 export async function downloadSub2APIExport(url: string, fallbackName: string) {
@@ -574,6 +667,81 @@ export async function resetRegister() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
 }
 
+export async function deleteRegisteredAccounts(emails: string[]) {
+  return httpRequest<{ register: RegisterConfig; removed: number }>("/api/register/accounts", {
+    method: "DELETE",
+    body: { emails },
+  });
+}
+
+export async function recoverRegisteredAccounts(emails: string[]) {
+  return httpRequest<{
+    register: RegisterConfig;
+    recovered: number;
+    errors: Array<{
+      email: string;
+      error: string;
+      manual_code_required?: boolean;
+      status?: string;
+      session_id?: string;
+      api_base?: string;
+      expires_in?: number;
+      mailbox?: Record<string, unknown>;
+    }>;
+  }>(
+    "/api/register/accounts/recover",
+    {
+      method: "POST",
+      body: { emails },
+    },
+  );
+}
+
+export async function backfillRegisteredAccountsMailMetadata() {
+  return httpRequest<{ register: RegisterConfig; updated: number }>("/api/register/accounts/backfill-mail-metadata", {
+    method: "POST",
+  });
+}
+
+export async function startManualRegisteredAccountRecovery(email: string) {
+  return httpRequest<{
+    status: "manual_code_required" | "complete" | "error" | string;
+    session_id?: string;
+    email?: string;
+    api_base?: string;
+    expires_in?: number;
+    recovered?: number;
+    error?: string;
+    register?: RegisterConfig;
+  }>("/api/register/accounts/recover/manual/start", {
+    method: "POST",
+    body: { email },
+  });
+}
+
+export async function completeManualRegisteredAccountRecovery(sessionId: string, code: string) {
+  return httpRequest<{
+    status: "complete" | "error" | string;
+    recovered?: number;
+    email?: string;
+    error?: string;
+    register?: RegisterConfig;
+  }>("/api/register/accounts/recover/manual/complete", {
+    method: "POST",
+    body: { session_id: sessionId, code },
+  });
+}
+
+export async function importRegisteredAccountsToLocalPool(emails: string[] = []) {
+  return httpRequest<{ register: RegisterConfig; imported: number; skipped: number; errors: Array<{ email: string; error: string }> }>(
+    "/api/register/accounts/import-local-pool",
+    {
+      method: "POST",
+      body: { emails },
+    },
+  );
+}
+
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────
 
 export type CPAPool = {
@@ -664,6 +832,8 @@ export type Sub2APIRemoteAccount = {
   status: string;
   expires_at: string;
   has_refresh_token: boolean;
+  proxy_id?: string;
+  has_proxy?: boolean;
 };
 
 export type Sub2APIRemoteGroup = {

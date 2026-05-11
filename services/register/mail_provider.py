@@ -20,6 +20,20 @@ domain_lock = Lock()
 provider_lock = Lock()
 domain_index = 0
 provider_index = 0
+suppressed_domains: dict[str, tuple[float, str]] = {}
+
+
+def suppress_domain(domain: str, reason: str = "", ttl_seconds: float = 3600.0) -> None:
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return
+    with domain_lock:
+        suppressed_domains[normalized] = (time.monotonic() + max(60.0, ttl_seconds), str(reason or "").strip())
+
+
+def clear_suppressed_domains() -> None:
+    with domain_lock:
+        suppressed_domains.clear()
 
 
 def _config(mail_config: dict) -> dict:
@@ -44,11 +58,17 @@ def _next_domain(domains: list[str]) -> str:
     domains = [str(item).strip() for item in domains if str(item).strip()]
     if not domains:
         raise RuntimeError("mail.domain 不能为空")
-    if len(domains) == 1:
-        return domains[0]
+    now = time.monotonic()
     with domain_lock:
-        value = domains[domain_index % len(domains)]
-        domain_index = (domain_index + 1) % len(domains)
+        expired = [domain for domain, (until, _) in suppressed_domains.items() if until <= now]
+        for domain in expired:
+            suppressed_domains.pop(domain, None)
+        available = [domain for domain in domains if domain.lower() not in suppressed_domains]
+        candidates = available or domains
+        if len(candidates) == 1:
+            return candidates[0]
+        value = candidates[domain_index % len(candidates)]
+        domain_index = (domain_index + 1) % len(candidates)
         return value
 
 
@@ -168,20 +188,32 @@ class BaseMailProvider:
 
     def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        last_error = ""
         while time.monotonic() < deadline:
-            message = self.fetch_latest_message(mailbox)
+            try:
+                message = self.fetch_latest_message(mailbox)
+            except Exception as exc:
+                last_error = str(exc) or exc.__class__.__name__
+                mailbox["_last_wait_error"] = last_error
+                time.sleep(max(0.2, self.conf["wait_interval"]))
+                continue
             if message:
                 result = on_message(message)
                 if result is not None:
                     return result
             time.sleep(max(0.2, self.conf["wait_interval"]))
+        if last_error:
+            mailbox["_last_wait_error"] = last_error
         return None
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
-        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        seen_value = mailbox.get("_seen_code_message_refs") or mailbox.get("seen_code_message_refs") or []
+        mailbox["_seen_code_message_refs"] = seen_value
+        mailbox["seen_code_message_refs"] = seen_value
         if not isinstance(seen_value, list):
             seen_value = []
             mailbox["_seen_code_message_refs"] = seen_value
+            mailbox["seen_code_message_refs"] = seen_value
         seen_refs = {str(item) for item in seen_value}
 
         def extract_unseen_code(message: dict[str, Any]) -> str | None:
@@ -414,18 +446,44 @@ class MoEmailProvider(BaseMailProvider):
         return data
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        data = self._request("POST", "/api/emails/generate", payload={"name": username or _random_mailbox_name(), "expiryTime": self.expiry_time, "domain": _next_domain(self.domain)}, expected=(200, 201))
+        domain = _next_domain(self.domain)
+        payload = {"name": username or _random_mailbox_name(), "domain": domain}
+        if self.expiry_time:
+            payload["expiryTime"] = self.expiry_time
+        data = self._request("POST", "/api/emails/generate", payload=payload, expected=(200, 201))
         address = str(data.get("email") or "").strip()
         email_id = str(data.get("id") or data.get("email_id") or "").strip()
         if not address or not email_id:
             raise RuntimeError("MoEmail 缺少 email 或 id")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "email_id": email_id}
+        expires_at = str(data.get("expiresAt") or data.get("expires_at") or data.get("expireAt") or "").strip()
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "email_id": email_id,
+            "domain": domain,
+            "api_base": self.api_base,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **({"expires_at": expires_at} if expires_at else {}),
+        }
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         email_id = str(mailbox.get("email_id") or "").strip()
         if not email_id:
+            email_id = str(mailbox.get("address") or "").strip()
+            if email_id:
+                mailbox["email_id"] = email_id
+        if not email_id:
             raise RuntimeError("MoEmail 缺少 email_id")
-        data = self._request("GET", f"/api/emails/{email_id}")
+        try:
+            data = self._request("GET", f"/api/emails/{email_id}")
+        except Exception as exc:
+            address = str(mailbox.get("address") or "").strip()
+            if address and address != email_id:
+                mailbox["email_id"] = address
+                data = self._request("GET", f"/api/emails/{address}")
+            else:
+                raise exc
         items = data.get("messages") or []
         messages = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
         if not messages:

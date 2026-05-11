@@ -8,7 +8,7 @@ set "MAIN_BRANCH=main"
 set "HAS_CHANGES="
 set "STASHED="
 
-echo [1/7] Checking git repository...
+echo [1/6] Checking git repository...
 git rev-parse --is-inside-work-tree >nul 2>nul
 if errorlevel 1 (
   echo This directory is not a git repository.
@@ -16,7 +16,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [2/7] Checking remotes...
+echo [2/6] Checking remotes...
 git remote get-url upstream >nul 2>nul
 if errorlevel 1 (
   echo Missing upstream remote. Expected official repo remote named upstream.
@@ -31,7 +31,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [3/7] Switching to %CUSTOM_BRANCH%...
+echo [3/6] Switching to %CUSTOM_BRANCH%...
 git switch %CUSTOM_BRANCH%
 if errorlevel 1 goto :fail
 
@@ -39,19 +39,19 @@ for /f "delims=" %%i in ('git status --porcelain') do set "HAS_CHANGES=1"
 if defined HAS_CHANGES (
   set "STASH_NAME=auto-stash-before-update-%date:/=-%-%time::=-%"
   set "STASH_NAME=!STASH_NAME: =0!"
-  echo [4/7] Stashing local uncommitted changes...
+  echo [4/6] Stashing local uncommitted changes...
   git stash push -u -m "!STASH_NAME!"
   if errorlevel 1 goto :fail
   set "STASHED=1"
 ) else (
-  echo [4/7] Working tree is clean.
+  echo [4/6] Working tree is clean.
 )
 
-echo [5/7] Fetching official upstream...
+echo [5/6] Fetching official upstream...
 git fetch upstream
 if errorlevel 1 goto :fail
 
-echo [6/7] Merging upstream/%MAIN_BRANCH% into %CUSTOM_BRANCH%...
+echo [6/6] Merging upstream/%MAIN_BRANCH% into %CUSTOM_BRANCH%...
 git merge upstream/%MAIN_BRANCH%
 if errorlevel 1 (
   echo.
@@ -59,7 +59,7 @@ if errorlevel 1 (
   echo Resolve conflicts, then run:
   echo   git add ^<files^>
   echo   git commit
-  echo   docker compose up -d --build
+  echo Then run build-custom.bat.
   pause
   exit /b 1
 )
@@ -68,18 +68,14 @@ if defined STASHED (
   echo Re-applying stashed local changes...
   git stash pop
   if errorlevel 1 (
-    echo Stash pop had conflicts. Resolve them manually before building.
+    echo Stash pop had conflicts. Resolve them manually, then run build-custom.bat.
     pause
     exit /b 1
   )
 )
 
-echo [7/7] Rebuilding Docker containers from local source...
-docker compose up -d --build
-if errorlevel 1 goto :fail
-
 echo.
-echo Update complete. Current branch should be %CUSTOM_BRANCH%.
+echo Update complete. Run build-custom.bat to rebuild Docker containers.
 pause
 exit /b 0
 

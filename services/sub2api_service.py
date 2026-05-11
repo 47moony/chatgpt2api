@@ -10,11 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 from curl_cffi.requests import Session
 
 from services.account_service import account_service
 from services.config import DATA_DIR
+from services.proxy_pool_service import proxy_key
 
 
 SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
@@ -34,6 +36,38 @@ def _now_iso() -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_sub2api_proxy(raw: object) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    host = _clean(raw.get("host"))
+    port = _int_or_none(raw.get("port"))
+    if not host or port is None:
+        return None
+    proxy: dict[str, Any] = {
+        "name": _clean(raw.get("name")),
+        "protocol": _clean(raw.get("protocol")) or "http",
+        "host": host,
+        "port": port,
+        "username": _clean(raw.get("username")),
+        "password": _clean(raw.get("password")),
+        "status": _clean(raw.get("status")) or "active",
+    }
+    proxy_id = _clean(raw.get("id"))
+    if proxy_id:
+        proxy["sub2api_proxy_id"] = proxy_id
+    key = proxy_key(proxy)
+    if key:
+        proxy["proxy_key"] = key
+    return proxy
 
 
 def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
@@ -245,6 +279,14 @@ def _extract_access_token(credentials: object) -> str:
     return ""
 
 
+def _extract_proxy_id(account: dict[str, Any]) -> str:
+    proxy_id = _clean(account.get("proxy_id"))
+    if proxy_id:
+        return proxy_id
+    proxy = account.get("proxy") if isinstance(account.get("proxy"), dict) else {}
+    return _clean(proxy.get("id"))
+
+
 def _unwrap_envelope(payload: object) -> object:
     """Peel sub2api's `{code, message, data}` envelope, returning the inner `data` field
     when present. Also handles unwrapped responses from older/alt versions."""
@@ -313,6 +355,7 @@ def list_remote_accounts(server: dict) -> list[dict]:
                 if not access_token:
                     continue
                 account_id = account.get("id")
+                proxy_id = _extract_proxy_id(account)
                 items.append({
                     "id": str(account_id) if account_id is not None else _clean(credentials.get("chatgpt_account_id")),
                     "name": _clean(account.get("name")),
@@ -321,6 +364,8 @@ def list_remote_accounts(server: dict) -> list[dict]:
                     "status": _clean(account.get("status")),
                     "expires_at": _clean(credentials.get("expires_at")),
                     "has_refresh_token": bool(_clean(credentials.get("refresh_token"))),
+                    "proxy_id": proxy_id,
+                    "has_proxy": bool(proxy_id),
                 })
 
             if page * 200 >= total or len(data) < 200:
@@ -330,6 +375,30 @@ def list_remote_accounts(server: dict) -> list[dict]:
         session.close()
 
     return items
+
+
+def _fetch_proxy_by_id(server: dict, proxy_id: str) -> dict[str, Any] | None:
+    base_url = _clean(server.get("base_url"))
+    headers = _auth_headers(server)
+    proxy_id = _clean(proxy_id)
+    if not base_url or not proxy_id:
+        return None
+
+    session = Session(verify=True)
+    try:
+        response = session.get(
+            f"{base_url.rstrip('/')}/api/v1/admin/proxies/{proxy_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if not response.ok:
+            return None
+        payload = response.json()
+    finally:
+        session.close()
+
+    proxy = _unwrap_envelope(payload)
+    return _normalize_sub2api_proxy(proxy)
 
 
 def list_remote_groups(server: dict) -> list[dict]:
@@ -387,8 +456,8 @@ def list_remote_groups(server: dict) -> list[dict]:
     return items
 
 
-def _fetch_access_token_for_account(server: dict, account_id: str) -> tuple[str, dict]:
-    """Return (access_token, account_meta) for a single sub2api account id."""
+def _fetch_account_record(server: dict, account_id: str) -> dict[str, Any]:
+    """Return a local account-pool record for a single sub2api account id."""
     base_url = _clean(server.get("base_url"))
     headers = _auth_headers(server)
 
@@ -412,10 +481,26 @@ def _fetch_access_token_for_account(server: dict, account_id: str) -> tuple[str,
     access_token = _extract_access_token(credentials)
     if not access_token:
         raise RuntimeError("missing access_token")
-    return access_token, {
-        "email": _clean(credentials.get("email")),
-        "plan_type": _clean(credentials.get("plan_type")),
+    proxy_id = _extract_proxy_id(account)
+    proxy = _fetch_proxy_by_id(server, proxy_id) if proxy_id else None
+    if proxy is None:
+        proxy = _normalize_sub2api_proxy(account.get("proxy"))
+
+    record: dict[str, Any] = {
+        "access_token": access_token,
+        "email": _clean(credentials.get("email")) or _clean(account.get("name")) or None,
+        "type": _clean(credentials.get("plan_type")) or "free",
+        "status": "正常",
+        "quota": 0,
+        "image_quota_unknown": True,
+        "sub2api_account_id": _clean(account.get("id")) or account_id,
+        "credential_owner": "sub2api",
     }
+    if proxy:
+        record["proxy"] = proxy
+        if proxy.get("proxy_key"):
+            record["proxy_key"] = str(proxy.get("proxy_key") or "").strip()
+    return record
 
 
 class Sub2APIImportService:
@@ -472,18 +557,17 @@ class Sub2APIImportService:
     def _run_import(self, server_id: str, server: dict, account_ids: list[str]) -> None:
         self._update_job(server_id, status="running")
 
-        tokens: list[str] = []
+        records: list[dict[str, Any]] = []
         max_workers = min(8, max(1, len(account_ids)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
-                executor.submit(_fetch_access_token_for_account, server, account_id): account_id
+                executor.submit(_fetch_account_record, server, account_id): account_id
                 for account_id in account_ids
             }
             for future in as_completed(future_map):
                 account_id = future_map[future]
                 try:
-                    token, _meta = future.result()
-                    tokens.append(token)
+                    records.append(future.result())
                 except Exception as exc:
                     self._append_error(server_id, account_id, str(exc) or "unknown error")
 
@@ -495,7 +579,7 @@ class Sub2APIImportService:
                     failed=failed,
                 )
 
-        if not tokens:
+        if not records:
             current = self._config.get_import_job(server_id) or {}
             self._update_job(
                 server_id,
@@ -505,8 +589,7 @@ class Sub2APIImportService:
             )
             return
 
-        add_result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+        add_result = account_service.add_account_records(records)
         current = self._config.get_import_job(server_id) or {}
         self._update_job(
             server_id,
@@ -514,7 +597,7 @@ class Sub2APIImportService:
             completed=len(account_ids),
             added=int(add_result.get("added") or 0),
             skipped=int(add_result.get("skipped") or 0),
-            refreshed=int(refresh_result.get("refreshed") or 0),
+            refreshed=0,
             failed=len(current.get("errors") or []),
         )
 
