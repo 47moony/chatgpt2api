@@ -30,7 +30,4 @@ docker-compose-local.yml
 git_cache/
 .claude/settings.json
 config.json
-CODEX_IMAGE_API.md
-CODEX_IMAGE_CLIENT.md
-CODEX_IMAGE_GATEWAY.md
-CODEX_IMAGE_LOCAL_SERVICE_CLIENT.md
+CODEX_IMAGE*.md
