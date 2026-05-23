@@ -7,6 +7,8 @@ import os
 import re
 import secrets
 import asyncio
+import threading
+import time
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlparse
@@ -24,7 +26,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 GATEWAY_KEY_FILE = DATA_DIR / "image_gateway.key"
+GATEWAY_LOG_FILE = DATA_DIR / "image_gateway.log"
 DEFAULT_UPSTREAM_URL = "http://127.0.0.1:3000"
+_LOG_LOCK = threading.Lock()
 
 
 class GatewayImageRequest(BaseModel):
@@ -39,6 +43,19 @@ class GatewayImageRequest(BaseModel):
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _log_gateway_event(request_id: str, stage: str, **fields: object) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    item = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "request_id": request_id,
+        "stage": stage,
+        **fields,
+    }
+    with _LOG_LOCK:
+        with GATEWAY_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def _read_config_auth_key() -> str:
@@ -193,7 +210,7 @@ def _is_retryable_upstream_error(status_code: int, detail: object) -> bool:
     return True
 
 
-def _post_upstream_generate(body: GatewayImageRequest) -> dict:
+def _post_upstream_generate(body: GatewayImageRequest, request_id: str = "") -> dict:
     auth_key = _upstream_auth_key()
     if not auth_key:
         raise RuntimeError("upstream auth key is not configured")
@@ -212,11 +229,21 @@ def _post_upstream_generate(body: GatewayImageRequest) -> dict:
         },
     }
     request_kwargs["timeout"] = _request_timeout()
+    started = time.perf_counter()
     response = curl_requests.post(f"{upstream}/v1/images/generations", **request_kwargs)
+    upstream_ms = round((time.perf_counter() - started) * 1000, 1)
     try:
         payload = response.json()
     except Exception:
         payload = {"error": response.text}
+    if request_id:
+        _log_gateway_event(
+            request_id,
+            "upstream_generate_returned",
+            status_code=response.status_code,
+            upstream_ms=upstream_ms,
+            data_count=len(payload.get("data") or []) if isinstance(payload, dict) and isinstance(payload.get("data"), list) else 0,
+        )
     if response.status_code >= 400:
         detail = payload.get("detail") if isinstance(payload, dict) else payload
         if detail is None and isinstance(payload, dict):
@@ -233,7 +260,7 @@ def _post_upstream_generate(body: GatewayImageRequest) -> dict:
     return payload
 
 
-def _post_upstream_edit(form: dict[str, object], images: list[tuple[bytes, str, str]]) -> dict:
+def _post_upstream_edit(form: dict[str, object], images: list[tuple[bytes, str, str]], request_id: str = "") -> dict:
     auth_key = _upstream_auth_key()
     if not auth_key:
         raise RuntimeError("upstream auth key is not configured")
@@ -252,14 +279,26 @@ def _post_upstream_edit(form: dict[str, object], images: list[tuple[bytes, str, 
         "multipart": multipart,
     }
     request_kwargs["timeout"] = _request_timeout()
+    started = time.perf_counter()
     try:
         response = curl_requests.post(f"{upstream}/v1/images/edits", **request_kwargs)
     finally:
         multipart.close()
+    upstream_ms = round((time.perf_counter() - started) * 1000, 1)
     try:
         payload = response.json()
     except Exception:
         payload = {"error": response.text}
+    if request_id:
+        _log_gateway_event(
+            request_id,
+            "upstream_edit_returned",
+            status_code=response.status_code,
+            upstream_ms=upstream_ms,
+            image_count=len(images),
+            upload_bytes=sum(len(item[0]) for item in images),
+            data_count=len(payload.get("data") or []) if isinstance(payload, dict) and isinstance(payload.get("data"), list) else 0,
+        )
     if response.status_code >= 400:
         detail = payload.get("detail") if isinstance(payload, dict) else payload
         if detail is None and isinstance(payload, dict):
@@ -315,17 +354,29 @@ async def generate(
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> dict:
     _require_gateway_key(authorization, x_api_key)
+    request_id = secrets.token_hex(6)
+    request_started = time.perf_counter()
+    _log_gateway_event(request_id, "generate_received", model=body.model, size=body.size, n=body.n)
     attempts = 0
     last_error = ""
     while body.max_attempts == 0 or attempts < body.max_attempts:
         attempts += 1
         try:
-            result = await run_in_threadpool(_post_upstream_generate, body)
+            attempt_started = time.perf_counter()
+            _log_gateway_event(request_id, "generate_attempt_start", attempt=attempts)
+            result = await run_in_threadpool(_post_upstream_generate, body, request_id)
             data = result.get("data")
             if not isinstance(data, list) or not data:
                 raise RuntimeError(str(result.get("message") or "image generation returned no image data"))
             rewritten = _rewrite_result_urls(request, result)
             if not isinstance(rewritten, dict):
+                _log_gateway_event(
+                    request_id,
+                    "generate_return",
+                    attempts=attempts,
+                    attempt_ms=round((time.perf_counter() - attempt_started) * 1000, 1),
+                    total_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                )
                 return {"ok": True, "attempts": attempts, "result": rewritten}
             urls = _collect_image_urls(rewritten.get("data"))
             rewritten["ok"] = True
@@ -334,11 +385,20 @@ async def generate(
             rewritten["size"] = body.size
             rewritten["urls"] = urls
             rewritten["image_urls"] = urls
+            _log_gateway_event(
+                request_id,
+                "generate_return",
+                attempts=attempts,
+                attempt_ms=round((time.perf_counter() - attempt_started) * 1000, 1),
+                total_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                url_count=len(urls),
+            )
             return rewritten
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
             last_error = str(detail.get("error") or exc.detail or "")
             retryable = bool(detail.get("retryable", _is_retryable_upstream_error(int(exc.status_code), detail)))
+            _log_gateway_event(request_id, "generate_attempt_error", attempt=attempts, status_code=exc.status_code, retryable=retryable, error=last_error[:300])
             if not retryable or (body.max_attempts and attempts >= body.max_attempts):
                 raise HTTPException(
                     status_code=exc.status_code,
@@ -346,6 +406,7 @@ async def generate(
                 ) from exc
         except Exception as exc:
             last_error = _sanitize_error_text(exc)
+            _log_gateway_event(request_id, "generate_attempt_error", attempt=attempts, status_code=502, retryable=True, error=last_error[:300])
             if body.max_attempts and attempts >= body.max_attempts:
                 raise HTTPException(
                     status_code=502,
@@ -372,6 +433,9 @@ async def edit(
     retry_delay_seconds: float = Form(default=5.0),
 ) -> dict:
     _require_gateway_key(authorization, x_api_key)
+    request_id = secrets.token_hex(6)
+    request_started = time.perf_counter()
+    read_started = time.perf_counter()
     prompt = _clean(prompt)
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
@@ -389,6 +453,16 @@ async def edit(
         if not data:
             raise HTTPException(status_code=400, detail={"error": "image file is empty"})
         images.append((data, upload.filename or "image.png", upload.content_type or "image/png"))
+    _log_gateway_event(
+        request_id,
+        "edit_received",
+        model=_clean(model) or "gpt-image-2",
+        size=_clean(size),
+        n=n,
+        image_count=len(images),
+        upload_bytes=sum(len(item[0]) for item in images),
+        read_upload_ms=round((time.perf_counter() - read_started) * 1000, 1),
+    )
 
     form = {
         "prompt": prompt,
@@ -402,23 +476,41 @@ async def edit(
     while max_attempts == 0 or attempts < max_attempts:
         attempts += 1
         try:
-            result = await run_in_threadpool(_post_upstream_edit, form, images)
+            attempt_started = time.perf_counter()
+            _log_gateway_event(request_id, "edit_attempt_start", attempt=attempts)
+            result = await run_in_threadpool(_post_upstream_edit, form, images, request_id)
             data = result.get("data")
             if not isinstance(data, list) or not data:
                 raise RuntimeError(str(result.get("message") or "image edit returned no image data"))
             rewritten = _rewrite_result_urls(request, result)
             if not isinstance(rewritten, dict):
+                _log_gateway_event(
+                    request_id,
+                    "edit_return",
+                    attempts=attempts,
+                    attempt_ms=round((time.perf_counter() - attempt_started) * 1000, 1),
+                    total_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                )
                 return {"ok": True, "attempts": attempts, "result": rewritten}
             urls = _collect_image_urls(rewritten.get("data"))
             rewritten["ok"] = True
             rewritten["attempts"] = attempts
             rewritten["urls"] = urls
             rewritten["image_urls"] = urls
+            _log_gateway_event(
+                request_id,
+                "edit_return",
+                attempts=attempts,
+                attempt_ms=round((time.perf_counter() - attempt_started) * 1000, 1),
+                total_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                url_count=len(urls),
+            )
             return rewritten
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
             last_error = str(detail.get("error") or exc.detail or "")
             retryable = bool(detail.get("retryable", _is_retryable_upstream_error(int(exc.status_code), detail)))
+            _log_gateway_event(request_id, "edit_attempt_error", attempt=attempts, status_code=exc.status_code, retryable=retryable, error=last_error[:300])
             if not retryable or (max_attempts and attempts >= max_attempts):
                 raise HTTPException(
                     status_code=exc.status_code,
@@ -426,6 +518,7 @@ async def edit(
                 ) from exc
         except Exception as exc:
             last_error = _sanitize_error_text(exc)
+            _log_gateway_event(request_id, "edit_attempt_error", attempt=attempts, status_code=502, retryable=True, error=last_error[:300])
             if max_attempts and attempts >= max_attempts:
                 raise HTTPException(
                     status_code=502,
