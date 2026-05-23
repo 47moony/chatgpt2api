@@ -42,6 +42,7 @@ def _config(mail_config: dict) -> dict:
         "wait_timeout": float(mail_config.get("wait_timeout") or 30),
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
+        "proxy": str(mail_config.get("proxy") or "").strip(),
     }
 
 
@@ -240,7 +241,10 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
-        self.session = curl_requests.Session(impersonate="chrome")
+        session_kwargs = {"impersonate": "chrome"}
+        if self.conf.get("proxy"):
+            session_kwargs["proxy"] = str(self.conf["proxy"])
+        self.session = curl_requests.Session(**session_kwargs)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
         resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
@@ -434,7 +438,10 @@ class MoEmailProvider(BaseMailProvider):
         else:
             self.domain = [str(raw_domains).strip()] if str(raw_domains).strip() else []
         self.expiry_time = int(entry.get("expiry_time") or 0)
-        self.session = curl_requests.Session(impersonate="chrome")
+        session_kwargs = {"impersonate": "chrome"}
+        if self.conf.get("proxy"):
+            session_kwargs["proxy"] = str(self.conf["proxy"])
+        self.session = curl_requests.Session(**session_kwargs)
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
         resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"X-API-Key": self.api_key, "Content-Type": "application/json", "User-Agent": self.conf["user_agent"]}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
@@ -447,10 +454,19 @@ class MoEmailProvider(BaseMailProvider):
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         domain = _next_domain(self.domain)
-        payload = {"name": username or _random_mailbox_name(), "domain": domain}
-        if self.expiry_time:
+        payload: dict[str, Any] = {"name": username or _random_mailbox_name(), "domain": domain}
+        if self.expiry_time > 0:
             payload["expiryTime"] = self.expiry_time
-        data = self._request("POST", "/api/emails/generate", payload=payload, expected=(200, 201))
+        try:
+            data = self._request("POST", "/api/emails/generate", payload=payload, expected=(200, 201))
+        except RuntimeError as exc:
+            message = str(exc)
+            if "过期时间" not in message and "expiry" not in message.lower():
+                raise
+            if payload.get("expiryTime"):
+                raise
+            retry_payload = {**payload, "expiryTime": 3600000}
+            data = self._request("POST", "/api/emails/generate", payload=retry_payload, expected=(200, 201))
         address = str(data.get("email") or "").strip()
         email_id = str(data.get("id") or data.get("email_id") or "").strip()
         if not address or not email_id:

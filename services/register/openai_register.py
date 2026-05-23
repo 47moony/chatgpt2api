@@ -452,12 +452,18 @@ def build_account_pool_record(result: dict, register_job_id: str = "") -> dict:
     return record
 
 
-def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(config["mail"], username)
+def _mail_config_with_proxy(proxy: str = "") -> dict:
+    mail_config = dict(config["mail"])
+    mail_config["proxy"] = str(proxy or config.get("proxy") or "").strip()
+    return mail_config
 
 
-def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(config["mail"], mailbox)
+def create_mailbox(username: str | None = None, proxy: str = "") -> dict:
+    return mail_provider.create_mailbox(_mail_config_with_proxy(proxy), username)
+
+
+def wait_for_code(mailbox: dict, proxy: str = "") -> str | None:
+    return mail_provider.wait_for_code(_mail_config_with_proxy(proxy), mailbox)
 
 
 class SentinelTokenGenerator:
@@ -701,6 +707,7 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
 
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
+        self.proxy = str(proxy or "").strip()
         self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
 
@@ -1015,7 +1022,7 @@ class PlatformRegistrar:
             if code:
                 step(index, "使用手动输入的邮箱验证码")
             else:
-                code = wait_for_code(mailbox) or ""
+                code = wait_for_code(mailbox, self.proxy) or ""
             if not code:
                 wait_error = str(mailbox.get("_last_wait_error") or "").strip()
                 raise RuntimeError(f"独立登录等待验证码超时{': ' + wait_error if wait_error else ''}")
@@ -1043,7 +1050,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox()
+        mailbox = create_mailbox(proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
         if not email:
             raise RuntimeError("邮箱服务未返回 address")
@@ -1055,7 +1062,7 @@ class PlatformRegistrar:
             self._run_retryable_step(index, "提交注册密码", lambda: self._register_user(email, password, index))
             self._run_retryable_step(index, "发送验证码", lambda: self._send_otp(index))
             step(index, "开始等待注册验证码")
-            code = wait_for_code(mailbox)
+            code = wait_for_code(mailbox, self.proxy)
             if not code:
                 wait_error = str(mailbox.get("_last_wait_error") or "").strip()
                 raise RuntimeError(f"等待注册验证码超时{': ' + wait_error if wait_error else ''}")
