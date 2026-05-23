@@ -26,13 +26,16 @@ echo.
 set "IMAGE_GATEWAY_EXISTING_PID="
 for /f "tokens=*" %%p in ('powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort %IMAGE_GATEWAY_PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $c.OwningProcess }"') do set "IMAGE_GATEWAY_EXISTING_PID=%%p"
 if not "%IMAGE_GATEWAY_EXISTING_PID%"=="" (
-  echo Image gateway is already listening on port %IMAGE_GATEWAY_PORT% ^(PID %IMAGE_GATEWAY_EXISTING_PID%^).
-  echo Health check: http://127.0.0.1:%IMAGE_GATEWAY_PORT%/health
-  powershell -NoProfile -Command "try { (Invoke-WebRequest -Uri 'http://127.0.0.1:%IMAGE_GATEWAY_PORT%/health' -UseBasicParsing -TimeoutSec 5).Content } catch { $_.Exception.Message }"
+  echo Existing image gateway found on port %IMAGE_GATEWAY_PORT% ^(PID %IMAGE_GATEWAY_EXISTING_PID%^). Restarting...
+  powershell -NoProfile -Command "Stop-Process -Id %IMAGE_GATEWAY_EXISTING_PID% -Force"
+  powershell -NoProfile -Command "$deadline = (Get-Date).AddSeconds(10); while ((Get-Date) -lt $deadline) { if (-not (Get-NetTCPConnection -LocalPort %IMAGE_GATEWAY_PORT% -State Listen -ErrorAction SilentlyContinue)) { exit 0 }; Start-Sleep -Milliseconds 250 }; exit 1"
+  if errorlevel 1 (
+    echo Failed to release port %IMAGE_GATEWAY_PORT%. Please close the existing process manually.
+    pause
+    exit /b 1
+  )
+  echo Existing gateway stopped.
   echo.
-  echo The gateway is already running. Close this window or press any key.
-  pause >nul
-  exit /b 0
 )
 
 .\.venv\Scripts\python.exe -m uvicorn image_gateway:app --host 0.0.0.0 --port %IMAGE_GATEWAY_PORT% --access-log
