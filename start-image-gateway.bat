@@ -29,6 +29,9 @@ if not "%IMAGE_GATEWAY_EXISTING_PID%"=="" (
   echo Image gateway is already listening on port %IMAGE_GATEWAY_PORT% ^(PID %IMAGE_GATEWAY_EXISTING_PID%^).
   echo Health check: http://127.0.0.1:%IMAGE_GATEWAY_PORT%/health
   powershell -NoProfile -Command "try { (Invoke-WebRequest -Uri 'http://127.0.0.1:%IMAGE_GATEWAY_PORT%/health' -UseBasicParsing -TimeoutSec 5).Content } catch { $_.Exception.Message }"
+  echo.
+  echo The gateway is already running. Close this window or press any key.
+  pause >nul
   exit /b 0
 )
 
