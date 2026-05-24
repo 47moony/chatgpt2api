@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-if "%IMAGE_GATEWAY_PORT%"=="" set "IMAGE_GATEWAY_PORT=3110"
+if "%IMAGE_GATEWAY_PORT%"=="" set "IMAGE_GATEWAY_PORT=3010"
 
 echo Image gateway listen port: %IMAGE_GATEWAY_PORT%
 echo.
