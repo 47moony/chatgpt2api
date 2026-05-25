@@ -38,15 +38,4 @@ if not "%IMAGE_GATEWAY_EXISTING_PID%"=="" (
   echo.
 )
 
-if not "%IMAGE_GATEWAY_PORT%"=="3010" (
-  set "IMAGE_GATEWAY_OLD_PID="
-  for /f "tokens=*" %%p in ('powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 3010 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $c.OwningProcess }"') do set "IMAGE_GATEWAY_OLD_PID=%%p"
-  if not "!IMAGE_GATEWAY_OLD_PID!"=="" (
-    echo Old image gateway found on port 3010 ^(PID !IMAGE_GATEWAY_OLD_PID!^). Stopping...
-    powershell -NoProfile -Command "Stop-Process -Id !IMAGE_GATEWAY_OLD_PID! -Force"
-    echo Old gateway stopped.
-    echo.
-  )
-)
-
 .\.venv\Scripts\python.exe -m uvicorn image_gateway:app --host 0.0.0.0 --port %IMAGE_GATEWAY_PORT% --access-log
