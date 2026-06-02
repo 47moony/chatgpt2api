@@ -86,6 +86,7 @@ def _config(mail_config: dict) -> dict:
     return {
         "request_timeout": float(mail_config.get("request_timeout") or 30),
         "wait_timeout": float(mail_config.get("wait_timeout") or 30),
+        "login_wait_timeout": float(mail_config.get("login_wait_timeout") or 90),
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
         "proxy": str(mail_config.get("proxy") or "").strip(),
@@ -761,8 +762,9 @@ class MoEmailProvider(BaseMailProvider):
             if "过期时间" not in message and "expiry" not in message.lower():
                 raise
             if payload.get("expiryTime"):
-                raise
-            retry_payload = {**payload, "expiryTime": 3600000}
+                retry_payload = {key: value for key, value in payload.items() if key != "expiryTime"}
+            else:
+                retry_payload = {**payload, "expiryTime": 3600000}
             data = self._request("POST", "/api/emails/generate", payload=retry_payload, expected=(200, 201))
         address = str(data.get("email") or "").strip()
         email_id = str(data.get("id") or data.get("email_id") or "").strip()

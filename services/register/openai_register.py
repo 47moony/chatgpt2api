@@ -314,6 +314,17 @@ def _mailbox_api_base(mailbox: dict) -> str:
     return str(mailbox.get("api_base") or "").strip()
 
 
+def _mailbox_log_label(mailbox: dict) -> str:
+    if not isinstance(mailbox, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("label", "provider_ref", "provider", "domain", "api_base", "email_id"):
+        value = str(mailbox.get(key) or "").strip()
+        if value:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
 def _record_domain_failure(email: str, reason: str, index: int) -> None:
     domain = _email_domain(email)
     if not domain:
@@ -458,12 +469,25 @@ def _mail_config_with_proxy(proxy: str = "") -> dict:
     return mail_config
 
 
+def _mail_config_for_login_code(proxy: str = "") -> dict:
+    mail_config = _mail_config_with_proxy(proxy)
+    login_timeout = float(mail_config.get("login_wait_timeout") or 90)
+    base_timeout = float(mail_config.get("wait_timeout") or 30)
+    mail_config["wait_timeout"] = max(base_timeout, login_timeout)
+    mail_config["wait_interval"] = max(1.0, float(mail_config.get("wait_interval") or 2))
+    return mail_config
+
+
 def create_mailbox(username: str | None = None, proxy: str = "") -> dict:
     return mail_provider.create_mailbox(_mail_config_with_proxy(proxy), username)
 
 
 def wait_for_code(mailbox: dict, proxy: str = "") -> str | None:
     return mail_provider.wait_for_code(_mail_config_with_proxy(proxy), mailbox)
+
+
+def wait_for_login_code(mailbox: dict, proxy: str = "") -> str | None:
+    return mail_provider.wait_for_code(_mail_config_for_login_code(proxy), mailbox)
 
 
 class SentinelTokenGenerator:
@@ -861,16 +885,25 @@ class PlatformRegistrar:
             )
 
         step(index, "开始提交邮箱")
-        resp, error = submit_email()
-        if resp is not None and resp.status_code == 409:
-            step(index, "邮箱提交 invalid_state，重新 authorize 后重试", "yellow")
-            for cookie in list(self.session.cookies):
-                if "auth.openai.com" in cookie.domain:
-                    self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-            self._login_authorize(email, index, code_verifier, code_challenge)
+        resp = None
+        error = ""
+        for attempt in range(1, 4):
             resp, error = submit_email()
+            if resp is not None and resp.status_code == 409:
+                step(index, "邮箱提交 invalid_state，重新 authorize 后重试", "yellow")
+                for cookie in list(self.session.cookies):
+                    if "auth.openai.com" in cookie.domain:
+                        self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+                self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
+                self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
+                self._login_authorize(email, index, code_verifier, code_challenge)
+                continue
+            if resp is not None and resp.status_code == 429 and attempt < 3:
+                delay = 15 * attempt
+                step(index, f"邮箱提交被限流 429，等待 {delay}s 后重试 {attempt}/3", "yellow")
+                time.sleep(delay)
+                continue
+            break
 
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -984,6 +1017,14 @@ class PlatformRegistrar:
             "password_verify_http_502",
             "password_verify_http_503",
             "password_verify_http_504",
+            "email_submit_http_408",
+            "email_submit_http_409",
+            "email_submit_http_425",
+            "email_submit_http_429",
+            "email_submit_http_500",
+            "email_submit_http_502",
+            "email_submit_http_503",
+            "email_submit_http_504",
             "platform_login_authorize_failed",
             "platform_login_authorize_http_408",
             "platform_login_authorize_http_409",
@@ -1083,7 +1124,7 @@ class PlatformRegistrar:
             if code:
                 step(index, "使用手动输入的邮箱验证码")
             else:
-                code = wait_for_code(mailbox, self.proxy) or ""
+                code = wait_for_login_code(mailbox, self.proxy) or ""
             if not code:
                 wait_error = str(mailbox.get("_last_wait_error") or "").strip()
                 raise RuntimeError(f"独立登录等待验证码超时{': ' + wait_error if wait_error else ''}")
@@ -1115,8 +1156,8 @@ class PlatformRegistrar:
         email = str(mailbox.get("address") or "").strip()
         if not email:
             raise RuntimeError("邮箱服务未返回 address")
-        label = str(mailbox.get("label") or "")
-        step(index, f"邮箱创建完成[{label}]: {email}")
+        label = _mailbox_log_label(mailbox)
+        step(index, f"邮箱创建完成[{label or 'metadata=empty'}]: {email}")
         password = _random_password()
         first_name, last_name = _random_name()
         try:

@@ -4,6 +4,8 @@ import json
 import threading
 import time
 import uuid
+from collections import defaultdict
+from contextlib import ExitStack
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +18,8 @@ from services.proxy_pool_service import load_available_proxies, proxy_by_key, pr
 
 REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_LOG_DIR = DATA_DIR / "register_logs"
+REGISTER_PROVIDER_CONCURRENCY = 2
+REGISTER_DOMAIN_CONCURRENCY = 1
 
 
 def _now() -> str:
@@ -256,6 +260,12 @@ class RegisterService:
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
         self._manual_recovery_sessions: dict[str, dict] = {}
+        self._register_provider_locks: dict[str, threading.Semaphore] = defaultdict(
+            lambda: threading.Semaphore(REGISTER_PROVIDER_CONCURRENCY)
+        )
+        self._register_domain_locks: dict[str, threading.Semaphore] = defaultdict(
+            lambda: threading.Semaphore(REGISTER_DOMAIN_CONCURRENCY)
+        )
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         self._backfill_registered_accounts_from_pool()
@@ -1106,6 +1116,33 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
+    def _mail_concurrency_keys(self, task_index: int) -> tuple[str, str]:
+        providers = ((self.get().get("mail") or {}).get("providers") or [])
+        enabled: list[dict] = [item for item in providers if isinstance(item, dict) and item.get("enable")]
+        if not enabled:
+            return "mail:none", "domain:none"
+        provider = enabled[(max(1, task_index) - 1) % len(enabled)]
+        provider_type = str(provider.get("type") or "unknown").strip() or "unknown"
+        api_base = str(provider.get("api_base") or provider.get("cf_api_base") or provider.get("base_url") or "").strip().rstrip("/")
+        provider_key = f"{provider_type}:{api_base or task_index}"
+        domains = provider.get("domain") or provider.get("default_domain") or []
+        if isinstance(domains, str):
+            domains = [item.strip() for item in domains.splitlines() if item.strip()]
+        if not isinstance(domains, list):
+            domains = []
+        domain = str(domains[(max(1, task_index) - 1) % len(domains)]).strip().lower() if domains else ""
+        return provider_key, f"{provider_key}:{domain or 'domain:none'}"
+
+    def _register_worker(self, index: int, job_id: str) -> dict:
+        provider_key, domain_key = self._mail_concurrency_keys(index)
+        with self._lock:
+            provider_lock = self._register_provider_locks[provider_key]
+            domain_lock = self._register_domain_locks[domain_key]
+        with ExitStack() as stack:
+            stack.enter_context(provider_lock)
+            stack.enter_context(domain_lock)
+            return openai_register.worker(index, job_id)
+
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
@@ -1115,7 +1152,7 @@ class RegisterService:
                 cfg = self.get()
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted, str(cfg.get("stats", {}).get("job_id") or "")))
+                    futures.add(executor.submit(self._register_worker, submitted, str(cfg.get("stats", {}).get("job_id") or "")))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break

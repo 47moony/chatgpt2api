@@ -830,6 +830,42 @@ class OpenAIBackendAPI:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
         skip_patterns = {"file_upload"}
+        # ChatGPT image tool events often expose both file-service:// and
+        # sediment:// pointers for the same generated asset. In practice the
+        # sediment attachment can be the larger original, while file-service may
+        # be a normalized 1024px copy, so prefer sediment and fall back to file.
+        if conversation_id:
+            for sediment_id in sediment_ids:
+                try:
+                    url = self._get_attachment_download_url(conversation_id, sediment_id)
+                except Exception as exc:
+                    logger.debug({
+                        "event": "image_download_url_failed",
+                        "source": "sediment",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                        "error": repr(exc),
+                    })
+                    continue
+                if url:
+                    urls.append(url)
+                else:
+                    logger.debug({
+                        "event": "image_download_url_empty",
+                        "source": "sediment",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                    })
+        if urls:
+            logger.debug({
+                "event": "image_urls_resolved",
+                "source": "sediment",
+                "conversation_id": conversation_id,
+                "file_ids": file_ids,
+                "sediment_ids": sediment_ids,
+                "urls": urls,
+            })
+            return urls
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -859,38 +895,9 @@ class OpenAIBackendAPI:
                     "conversation_id": conversation_id,
                     "id": file_id,
                 })
-        if urls or not conversation_id:
-            logger.debug({
-                "event": "image_urls_resolved",
-                "conversation_id": conversation_id,
-                "file_ids": file_ids,
-                "sediment_ids": sediment_ids,
-                "urls": urls,
-            })
-            return urls
-        for sediment_id in sediment_ids:
-            try:
-                url = self._get_attachment_download_url(conversation_id, sediment_id)
-            except Exception as exc:
-                logger.debug({
-                    "event": "image_download_url_failed",
-                    "source": "sediment",
-                    "conversation_id": conversation_id,
-                    "id": sediment_id,
-                    "error": repr(exc),
-                })
-                continue
-            if url:
-                urls.append(url)
-            else:
-                logger.debug({
-                    "event": "image_download_url_empty",
-                    "source": "sediment",
-                    "conversation_id": conversation_id,
-                    "id": sediment_id,
-                })
         logger.debug({
             "event": "image_urls_resolved",
+            "source": "file",
             "conversation_id": conversation_id,
             "file_ids": file_ids,
             "sediment_ids": sediment_ids,
@@ -917,10 +924,23 @@ class OpenAIBackendAPI:
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
-        for url in urls:
+        for index, url in enumerate(urls, start=1):
             response = self.session.get(url, timeout=120)
             ensure_ok(response, "image_download")
-            images.append(response.content)
+            data = response.content
+            try:
+                with Image.open(BytesIO(data)) as image:
+                    width, height = image.size
+                logger.info({
+                    "event": "image_downloaded",
+                    "index": index,
+                    "width": width,
+                    "height": height,
+                    "bytes": len(data),
+                })
+            except Exception:
+                logger.info({"event": "image_downloaded", "index": index, "bytes": len(data)})
+            images.append(data)
         return images
 
     def stream_conversation(
