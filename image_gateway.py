@@ -36,6 +36,7 @@ class GatewayImageRequest(BaseModel):
     model: str = "gpt-image-2"
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
+    quality: str = "auto"
     response_format: Literal["url", "b64_json"] = "url"
     max_attempts: int = Field(default=0, ge=0, le=10000)
     retry_delay_seconds: float = Field(default=5.0, ge=1.0, le=300.0)
@@ -225,6 +226,7 @@ def _post_upstream_generate(body: GatewayImageRequest, request_id: str = "") -> 
             "model": body.model,
             "n": body.n,
             "size": body.size,
+            "quality": body.quality,
             "response_format": body.response_format,
         },
     }
@@ -429,6 +431,7 @@ async def edit(
     n: int = Form(default=1),
     size: str | None = Form(default=None),
     response_format: Literal["url", "b64_json"] = Form(default="url"),
+    quality: str = Form(default="auto"),
     max_attempts: int = Form(default=0),
     retry_delay_seconds: float = Form(default=5.0),
 ) -> dict:
@@ -458,6 +461,7 @@ async def edit(
         "edit_received",
         model=_clean(model) or "gpt-image-2",
         size=_clean(size),
+        quality=_clean(quality) or "auto",
         n=n,
         image_count=len(images),
         upload_bytes=sum(len(item[0]) for item in images),
@@ -469,6 +473,7 @@ async def edit(
         "model": _clean(model) or "gpt-image-2",
         "n": n,
         "size": _clean(size),
+        "quality": _clean(quality) or "auto",
         "response_format": response_format,
     }
     attempts = 0

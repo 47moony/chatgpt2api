@@ -7,6 +7,12 @@ __pycache__
 *.pyo
 *.pyd
 
+data
+docs
+.claude
+.codex
+CODEX_IMAGE*.md
+
 web/.next
 web/node_modules
 

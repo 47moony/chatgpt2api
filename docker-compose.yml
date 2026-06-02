@@ -3,6 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NPM_CONFIG_PROXY: ${NPM_CONFIG_PROXY:-}
+        NPM_CONFIG_HTTPS_PROXY: ${NPM_CONFIG_HTTPS_PROXY:-}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     image: chatgpt2api:custom
     container_name: chatgpt2api
     restart: unless-stopped

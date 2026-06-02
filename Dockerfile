@@ -6,8 +6,13 @@ FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
 
 WORKDIR /app/web
 
+ARG NPM_CONFIG_PROXY=""
+ARG NPM_CONFIG_HTTPS_PROXY=""
+
 COPY web/package.json web/bun.lock ./
-RUN npm install
+RUN if [ -n "$NPM_CONFIG_PROXY" ]; then npm config set proxy "$NPM_CONFIG_PROXY"; fi \
+    && if [ -n "$NPM_CONFIG_HTTPS_PROXY" ]; then npm config set https-proxy "$NPM_CONFIG_HTTPS_PROXY"; fi \
+    && npm install
 
 COPY VERSION /app/VERSION
 COPY CHANGELOG.md /app/CHANGELOG.md
@@ -19,6 +24,9 @@ FROM --platform=$TARGETPLATFORM python:3.13-slim AS app
 
 ARG TARGETPLATFORM
 ARG TARGETARCH
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY=""
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
