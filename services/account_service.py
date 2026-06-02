@@ -1,71 +1,109 @@
 from __future__ import annotations
 
-import base64
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Condition, Lock
 from typing import Any
-
-from curl_cffi.requests import Session
 
 from services.config import config
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
-from services.proxy_pool_service import proxy_by_key, proxy_url
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
-
-
-OPENAI_AUTH_BASE = "https://auth.openai.com"
-OPENAI_REFRESH_SCOPE = "openid profile email"
-EXPORT_TIMEZONE = timezone(timedelta(hours=8))
-
-
-def _clean_string(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    parts = str(token or "").split(".")
-    if len(parts) < 2:
-        return {}
-    try:
-        payload = parts[1] + "=" * (-len(parts[1]) % 4)
-        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
-        data = json.loads(decoded.decode("utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _format_timestamp(value: Any) -> str:
-    try:
-        timestamp = int(value)
-    except (TypeError, ValueError):
-        return ""
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(EXPORT_TIMEZONE).isoformat(timespec="seconds")
-
-
-def _nested_dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
 
 
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
+    _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
+    _INVALID_CONFIRM_SECONDS = 30
+    _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
+    _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
+    _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
+    _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
+    _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+    _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
+    _OAUTH_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
+    )
+
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
+        self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        self._token_aliases: dict[str, str] = {}
+        self._cumulative_total = self._load_cumulative_total()
+
+    def _get_cumulative_file(self) -> Path:
+        from services.config import DATA_DIR
+        return DATA_DIR / ".cumulative_total"
+
+    def _load_cumulative_total(self) -> int:
+        try:
+            f = self._get_cumulative_file()
+            if f.exists():
+                return int(f.read_text().strip())
+        except Exception:
+            pass
+        return len(self._accounts)
+
+    def _save_cumulative_total(self) -> None:
+        try:
+            self._get_cumulative_file().write_text(str(self._cumulative_total))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> dict:
+        try:
+            payload = str(token or "").split(".")[1]
+            payload += "=" * ((4 - len(payload) % 4) % 4)
+            import base64
+            import json
+            data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_time(value: object) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _timestamp_to_iso(value: object) -> str:
+        try:
+            ts = int(value)
+        except (TypeError, ValueError):
+            return ""
+        tz = timezone(timedelta(hours=8))
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
 
     def _load_accounts(self) -> dict[str, dict]:
         accounts = self.storage.load_accounts()
@@ -88,369 +126,378 @@ class AccountService:
             return True
         return int(account.get("quota") or 0) > 0
 
+    @classmethod
+    def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
+        if not plan_type:
+            return True
+        normalized_plan = cls._normalize_account_type(plan_type)
+        normalized_account = cls._normalize_account_type(account.get("type"))
+        if not normalized_plan or not normalized_account:
+            return False
+        return normalized_plan.lower() == normalized_account.lower()
+
+    @classmethod
+    def _account_matches_source_type(cls, account: dict, source_type: str | None = None) -> bool:
+        if not source_type:
+            return True
+        return cls._normalize_source_type(account.get("source_type")) == cls._normalize_source_type(source_type)
+
+    @classmethod
+    def _account_matches_any_plan_type(cls, account: dict, plan_types: set[str] | tuple[str, ...] | None = None) -> bool:
+        if not plan_types:
+            return True
+        normalized_account = cls._normalize_account_type(account.get("type"))
+        normalized_plans = {
+            normalized
+            for plan_type in plan_types
+            if (normalized := cls._normalize_account_type(plan_type))
+        }
+        return bool(normalized_account and normalized_account in normalized_plans)
+
+    @staticmethod
+    def _normalize_source_type(value: object) -> str:
+        return str(value or "web").strip().lower() or "web"
+
+    @staticmethod
+    def _normalize_account_type(value: object) -> str | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        key = raw.lower().replace("-", "_").replace(" ", "_")
+        compact = key.replace("_", "")
+        aliases = {
+            "free": "free",
+            "plus": "Plus",
+            "pro": "Pro",
+            "prolite": "ProLite",
+            "team": "Team",
+            "business": "Team",
+            "enterprise": "Enterprise",
+        }
+        return aliases.get(compact) or aliases.get(key) or raw
+
+    def _search_account_type(self, payload: object) -> str | None:
+        if isinstance(payload, dict):
+            for key in ("plan_type", "account_plan", "account_type", "subscription_type", "type"):
+                plan = self._normalize_account_type(payload.get(key))
+                if plan:
+                    return plan
+            for value in payload.values():
+                plan = self._search_account_type(value)
+                if plan:
+                    return plan
+        elif isinstance(payload, list):
+            for value in payload:
+                plan = self._search_account_type(value)
+                if plan:
+                    return plan
+        return None
+
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
-        access_token = item.get("access_token") or ""
+        access_token = item.get("access_token") or item.get("accessToken") or ""
         if not access_token:
             return None
         normalized = dict(item)
+        normalized.pop("accessToken", None)
         normalized["access_token"] = access_token
+        if str(normalized.get("type") or "").strip().lower() == "codex":
+            normalized["export_type"] = "codex"
+            normalized.pop("type", None)
         normalized["type"] = normalized.get("type") or "free"
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
+        proxy = normalized.get("proxy")
+        normalized["proxy"] = dict(proxy) if isinstance(proxy, dict) else str(proxy or "").strip()
+        source_type = normalized.get("source_type")
+        if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
+            source_type = "codex"
+        normalized["source_type"] = self._normalize_source_type(source_type)
         limits_progress = normalized.get("limits_progress")
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
+        normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
+        normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
+        normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
+        normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
+        normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
+        normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
+        normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 
     @staticmethod
-    def _decode_jwt_payload(token: str) -> dict[str, Any]:
-        parts = str(token or "").split(".")
-        if len(parts) < 2:
-            return {}
+    def _jwt_exp(access_token: str) -> int:
         try:
-            payload = parts[1] + "=" * (-len(parts[1]) % 4)
-            data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
-            return data if isinstance(data, dict) else {}
+            return int(AccountService._decode_jwt_payload(access_token).get("exp") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _token_expires_in(cls, access_token: str) -> int | None:
+        exp = cls._jwt_exp(access_token)
+        if exp <= 0:
+            return None
+        return exp - int(time.time())
+
+    @classmethod
+    def _token_needs_refresh(cls, access_token: str, *, force: bool = False) -> bool:
+        if force:
+            return True
+        remaining = cls._token_expires_in(access_token)
+        return remaining is not None and remaining <= cls._ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+
+    @classmethod
+    def _token_issued_at(cls, access_token: str) -> datetime | None:
+        try:
+            iat = int(cls._decode_jwt_payload(access_token).get("iat") or 0)
+        except (TypeError, ValueError):
+            return None
+        if iat <= 0:
+            return None
+        return datetime.fromtimestamp(iat, tz=timezone.utc)
+
+    @staticmethod
+    def _safe_response_text(response: object, limit: int = 300) -> str:
+        try:
+            return str(getattr(response, "text", "") or "")[:limit]
         except Exception:
-            return {}
+            return ""
 
-    @staticmethod
-    def _auth_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        auth = payload.get("https://api.openai.com/auth") if isinstance(payload, dict) else {}
-        return auth if isinstance(auth, dict) else {}
+    def _resolve_access_token_locked(self, access_token: str) -> str:
+        token = str(access_token or "").strip()
+        seen: set[str] = set()
+        while token and token not in self._accounts and token in self._token_aliases and token not in seen:
+            seen.add(token)
+            token = self._token_aliases.get(token, token)
+        return token
 
-    @staticmethod
-    def _profile_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        profile = payload.get("https://api.openai.com/profile") if isinstance(payload, dict) else {}
-        return profile if isinstance(profile, dict) else {}
+    def resolve_access_token(self, access_token: str) -> str:
+        if not access_token:
+            return ""
+        with self._lock:
+            return self._resolve_access_token_locked(access_token)
 
-    @staticmethod
-    def _chatgpt_account_id_from_auth(auth: dict[str, Any]) -> str:
-        account_id = str(auth.get("chatgpt_account_id") or "").strip()
-        if account_id:
-            return account_id
-        account_user_id = str(auth.get("chatgpt_account_user_id") or "").strip()
-        if "__" in account_user_id:
-            suffix = account_user_id.rsplit("__", 1)[1].strip()
-            if suffix:
-                return suffix
-        return ""
+    def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(resolved)
+            return resolved, dict(account) if account else None
 
-    @staticmethod
-    def _organization_id_from_auth(auth: dict[str, Any]) -> str:
-        organization_id = str(auth.get("poid") or auth.get("organization_id") or "").strip()
-        if organization_id:
-            return organization_id
-        organizations = auth.get("organizations")
-        if isinstance(organizations, list):
-            default_id = ""
-            first_id = ""
-            for organization in organizations:
-                if not isinstance(organization, dict):
-                    continue
-                current = str(organization.get("id") or "").strip()
-                if not current:
-                    continue
-                first_id = first_id or current
-                if bool(organization.get("is_default")):
-                    default_id = current
-                    break
-            return default_id or first_id
-        return ""
+    def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(resolved)
+            if current is None:
+                return
+            next_item = dict(current)
+            next_item["last_token_refresh_error"] = str(error or "refresh token failed")
+            next_item["last_token_refresh_error_at"] = now
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[resolved] = account
+                self._save_accounts()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "refresh_token 刷新 access_token 失败",
+            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+        )
 
-    def _local_oauth_metadata(self, account: dict[str, Any]) -> dict[str, Any]:
-        oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
-        access_token = str(account.get("access_token") or "").strip()
-        access_payload = self._decode_jwt_payload(access_token)
-        id_payload = self._decode_jwt_payload(str(oauth.get("id_token") or "").strip())
-        access_auth = self._auth_from_payload(access_payload)
-        id_auth = self._auth_from_payload(id_payload)
-        profile = self._profile_from_payload(access_payload)
+    def _recent_token_refresh_error(self, account: dict) -> bool:
+        last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
+        if last_error_at is None:
+            return False
+        return (datetime.now(timezone.utc) - last_error_at).total_seconds() < self._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
 
-        metadata = {
-            "chatgpt_account_id": (
-                str(oauth.get("chatgpt_account_id") or "").strip()
-                or self._chatgpt_account_id_from_auth(access_auth)
-                or self._chatgpt_account_id_from_auth(id_auth)
-            ),
-            "chatgpt_user_id": (
-                str(oauth.get("chatgpt_user_id") or "").strip()
-                or str(access_auth.get("chatgpt_user_id") or access_auth.get("user_id") or "").strip()
-                or str(id_auth.get("chatgpt_user_id") or id_auth.get("user_id") or "").strip()
-                or str(account.get("user_id") or "").strip()
-            ),
-            "organization_id": (
-                str(oauth.get("organization_id") or "").strip()
-                or self._organization_id_from_auth(id_auth)
-                or self._organization_id_from_auth(access_auth)
-            ),
-            "email": (
-                str(oauth.get("email") or "").strip()
-                or str(account.get("email") or "").strip()
-                or str(profile.get("email") or id_payload.get("email") or access_payload.get("email") or "").strip()
-            ),
-            "plan_type": (
-                str(oauth.get("plan_type") or "").strip()
-                or str(access_auth.get("chatgpt_plan_type") or id_auth.get("chatgpt_plan_type") or "").strip()
-                or str(account.get("type") or "").strip()
-            ),
-        }
-        return {key: value for key, value in metadata.items() if value}
+    def _recent_refresh_token_keepalive_error(self, account: dict, now: datetime) -> bool:
+        last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
+        if last_error_at is None:
+            return False
+        return (now - last_error_at).total_seconds() < self._REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS
 
-    @staticmethod
-    def _proxy_url_for_account(account: dict[str, Any]) -> str:
-        account_proxy = account.get("proxy") if isinstance(account.get("proxy"), dict) else None
-        resolved = proxy_url(account_proxy) if account_proxy else ""
-        if resolved:
-            return resolved
-        proxy_ref = proxy_by_key(str(account.get("proxy_key") or ""))
-        resolved = proxy_url(proxy_ref) if proxy_ref else ""
-        return resolved or config.get_proxy_settings()
+    def _refresh_token_keepalive_anchor(self, account: dict) -> datetime | None:
+        return (
+            self._parse_time(account.get("last_token_refresh_at"))
+            or self._token_issued_at(str(account.get("access_token") or ""))
+            or self._parse_time(account.get("created_at"))
+        )
 
-    @staticmethod
-    def _iso_from_unix(timestamp: int | float) -> str:
-        return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
-
-    def _refresh_oauth_token(self, account: dict[str, Any]) -> dict[str, Any] | None:
-        if str(account.get("credential_owner") or "").strip() == "sub2api" or str(account.get("sub2api_account_id") or "").strip():
+    def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
+        if not str(account.get("refresh_token") or "").strip():
             return None
-        oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
-        refresh_token = str(oauth.get("refresh_token") or "").strip()
-        if not refresh_token:
+        if account.get("status") == "禁用":
             return None
+        if self._recent_refresh_token_keepalive_error(account, now):
+            return None
+        anchor = self._refresh_token_keepalive_anchor(account)
+        if anchor is None:
+            return now
+        due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
+        return due_at if due_at <= now else None
 
-        client_id = str(oauth.get("client_id") or "").strip()
-        if not client_id:
-            raise RuntimeError("refresh_token_missing_client_id")
-        proxy = self._proxy_url_for_account(account)
-        last_error = ""
-        session_kwargs: dict[str, Any] = {"impersonate": "chrome", "verify": True}
-        if proxy:
-            session_kwargs["proxy"] = proxy
-        session = Session(**session_kwargs)
+    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
+        from curl_cffi import requests
+        from services.proxy_service import proxy_settings
+
+        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome", verify=True))
         try:
             response = session.post(
-                f"{OPENAI_AUTH_BASE}/oauth/token",
+                self._OAUTH_TOKEN_URL,
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": "codex-cli/0.91.0",
+                    "User-Agent": self._OAUTH_USER_AGENT,
                 },
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "client_id": client_id,
-                    "scope": OPENAI_REFRESH_SCOPE,
+                    "client_id": self._OAUTH_CLIENT_ID,
                 },
                 timeout=60,
             )
-            if response.status_code != 200:
-                last_error = f"refresh_token_http_{response.status_code}: {response.text[:200]}"
-            else:
-                data = response.json()
-                access_token = str(data.get("access_token") or "").strip()
-                if not access_token:
-                    last_error = "refresh_token_missing_access_token"
-                else:
-                    id_token = str(data.get("id_token") or oauth.get("id_token") or "").strip()
-                    new_refresh_token = str(data.get("refresh_token") or refresh_token).strip()
-                    access_payload = self._decode_jwt_payload(access_token)
-                    issued_at = int(access_payload.get("iat") or time.time())
-                    expires_at = int(access_payload.get("exp") or (time.time() + int(data.get("expires_in") or 0)))
-                    refreshed_account = {
-                        **account,
-                        "access_token": access_token,
-                        "email": account.get("email"),
-                        "oauth": {
-                            **oauth,
-                            "_token_version": issued_at * 1000,
-                            "access_token": access_token,
-                            "refresh_token": new_refresh_token,
-                            "id_token": id_token,
-                            "client_id": client_id,
-                            "expires_at": self._iso_from_unix(expires_at),
-                            "expires_in": max(0, expires_at - int(time.time())),
-                        },
-                    }
-                    refreshed_account["oauth"].update(self._local_oauth_metadata(refreshed_account))
-                    return refreshed_account
-        except Exception as exc:
-            last_error = str(exc) or exc.__class__.__name__
+            data = response.json() if response.text else {}
+            if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
+                detail = ""
+                if isinstance(data, dict):
+                    detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
+                detail = detail or self._safe_response_text(response)
+                raise RuntimeError(f"oauth_refresh_http_{response.status_code}{': ' + detail if detail else ''}")
+            return {
+                "access_token": str(data.get("access_token") or "").strip(),
+                "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
+                "id_token": str(data.get("id_token") or "").strip(),
+            }
         finally:
             session.close()
 
-        if last_error:
-            raise RuntimeError(last_error)
-        return None
+    def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._image_slot_condition:
+            old_token = self._resolve_access_token_locked(old_access_token)
+            current = self._accounts.get(old_token)
+            if current is None:
+                return old_token
+            new_token = str(token_data.get("access_token") or old_token).strip()
+            if not new_token:
+                return old_token
 
-    def _replace_account(self, old_access_token: str, next_item: dict[str, Any]) -> dict | None:
-        old_access_token = str(old_access_token or "").strip()
-        new_access_token = str(next_item.get("access_token") or "").strip()
-        if not old_access_token or not new_access_token:
-            return None
-        with self._lock:
-            current = self._accounts.get(old_access_token, {})
-            account = self._normalize_account({**current, **next_item, "access_token": new_access_token})
+            next_item = dict(current)
+            next_item["access_token"] = new_token
+            if token_data.get("refresh_token"):
+                next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
+            if token_data.get("id_token"):
+                next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            next_item["last_token_refresh_at"] = now
+            next_item["last_token_refresh_error"] = None
+            next_item["last_token_refresh_error_at"] = None
+            next_item["invalid_count"] = 0
+            next_item["last_invalid_at"] = None
+            next_item["last_refresh_error"] = None
+            next_item["last_refresh_error_at"] = None
+
+            account = self._normalize_account(next_item)
             if account is None:
-                return None
-            if old_access_token != new_access_token:
-                self._accounts.pop(old_access_token, None)
-                inflight = self._image_inflight.pop(old_access_token, None)
-                if inflight is not None:
-                    self._image_inflight[new_access_token] = inflight
-            self._accounts[new_access_token] = account
+                return old_token
+
+            rotated = new_token != old_token
+            if rotated:
+                self._accounts.pop(old_token, None)
+                self._token_aliases[old_token] = new_token
+                old_inflight = int(self._image_inflight.pop(old_token, 0))
+                if old_inflight:
+                    self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+            self._accounts[new_token] = account
             self._save_accounts()
-            log_service.add(LOG_TYPE_ACCOUNT, "刷新 OAuth token",
-                            {"old_token": anonymize_token(old_access_token), "new_token": anonymize_token(new_access_token)})
-            return dict(account)
+            self._image_slot_condition.notify_all()
 
-    def ensure_oauth_metadata(
-        self,
-        access_token: str,
-        *,
-        allow_remote: bool = True,
-        allow_token_refresh: bool = False,
-        event: str = "ensure_oauth_metadata",
-    ) -> dict[str, Any]:
-        """Best-effort fill of OAuth metadata required by sub2api exports.
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "refresh_token 已刷新 access_token",
+            {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
+        )
+        return new_token
 
-        Local JWT parsing is cheap and always tried first. If chatgpt_account_id is
-        still missing, the ChatGPT backend account check is used as the source of
-        truth when allow_remote is enabled.
-        """
-        access_token = str(access_token or "").strip()
+    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
-            return {"ok": False, "updated": False, "chatgpt_account_id": "", "error": "access_token is required"}
-
-        account = self.get_account(access_token)
-        if account is None:
-            return {"ok": False, "updated": False, "chatgpt_account_id": "", "error": "account not found"}
-
-        local_metadata = self._local_oauth_metadata(account)
-        if local_metadata:
-            before = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
-            changed = any(str(before.get(key) or "").strip() != str(value or "").strip() for key, value in local_metadata.items())
-            if changed:
-                account = self.update_account(access_token, {"oauth": local_metadata}) or self.get_account(access_token) or account
-
-        oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
-        account_id = str(oauth.get("chatgpt_account_id") or "").strip()
-        if account_id or not allow_remote:
-            return {"ok": bool(account_id), "updated": bool(account_id), "chatgpt_account_id": account_id, "source": "local"}
-
-        token_for_remote = access_token
-        try:
-            refreshed = self.fetch_remote_info(access_token, event, invalidate_on_401=False)
-        except Exception as exc:
-            if not allow_token_refresh:
-                return {
-                    "ok": False,
-                    "updated": False,
-                    "chatgpt_account_id": "",
-                    "source": "remote",
-                    "error": str(exc),
-                }
-            account = self.get_account(access_token) or account
+            return ""
+        with self._token_refresh_lock:
+            resolved_token, account = self._get_account_for_token(access_token)
+            if not account:
+                return access_token
+            if (
+                str(account.get("credential_owner") or "").strip() == "sub2api"
+                or str(account.get("sub2api_account_id") or "").strip()
+            ):
+                return str(account.get("access_token") or resolved_token or access_token)
+            active_token = str(account.get("access_token") or resolved_token or access_token)
+            if not self._token_needs_refresh(active_token, force=force):
+                return active_token
+            refresh_token = str(account.get("refresh_token") or "").strip()
+            if not refresh_token:
+                return active_token
+            if not force and self._recent_token_refresh_error(account):
+                return active_token
             try:
-                refreshed_token_account = self._refresh_oauth_token(account)
-            except Exception as refresh_exc:
-                return {
-                    "ok": False,
-                    "updated": False,
-                    "chatgpt_account_id": "",
-                    "source": "refresh_token",
-                    "error": f"{exc}; refresh failed: {refresh_exc}",
-                }
-            if refreshed_token_account is None:
-                return {"ok": False, "updated": False, "chatgpt_account_id": "", "source": "remote", "error": str(exc)}
-            refreshed_token_account = self._replace_account(access_token, refreshed_token_account) or refreshed_token_account
-            token_for_remote = str(refreshed_token_account.get("access_token") or access_token)
-            try:
-                refreshed = self.fetch_remote_info(token_for_remote, event, invalidate_on_401=False)
-            except Exception as remote_exc:
-                refreshed = refreshed_token_account
-                remote_error = str(remote_exc)
-            else:
-                remote_error = ""
-        else:
-            remote_error = ""
+                token_data = self._request_access_token_refresh(refresh_token, account)
+            except Exception as exc:
+                self._record_token_refresh_error(active_token, event, str(exc))
+                return active_token
+            return self._apply_refreshed_tokens(active_token, token_data, event)
 
-        refreshed = refreshed or self.get_account(token_for_remote) or {}
-        oauth = refreshed.get("oauth") if isinstance(refreshed.get("oauth"), dict) else {}
-        account_id = str(oauth.get("chatgpt_account_id") or "").strip()
-        result = {
-            "ok": bool(account_id),
-            "updated": bool(account_id),
-            "chatgpt_account_id": account_id,
-            "source": "remote",
-            "access_token": token_for_remote,
-        }
-        if remote_error and not account_id:
-            result["error"] = remote_error
-        return result
+    def list_expiring_access_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for account in self._accounts.values()
+                if str(account.get("refresh_token") or "").strip()
+                and (token := str(account.get("access_token") or "").strip())
+                and self._token_needs_refresh(token)
+            ]
 
-    def backfill_oauth_metadata(
-        self,
-        access_tokens: list[str] | None = None,
-        *,
-        allow_remote: bool = True,
-        allow_token_refresh: bool = False,
-        event: str = "backfill_oauth_metadata",
-    ) -> dict[str, Any]:
-        tokens = list(dict.fromkeys(str(token or "").strip() for token in (access_tokens or self.list_tokens()) if str(token or "").strip()))
-        if not tokens:
-            return {"total": 0, "updated": 0, "missing": 0, "errors": [], "items": self.list_accounts()}
+    def list_refresh_token_keepalive_tokens(self) -> list[str]:
+        now = datetime.now(timezone.utc)
+        due_items: list[tuple[datetime, str]] = []
+        with self._lock:
+            for account in self._accounts.values():
+                due_at = self._refresh_token_keepalive_due_at(account, now)
+                token = str(account.get("access_token") or "").strip()
+                if due_at is not None and token:
+                    due_items.append((due_at, token))
+        due_items.sort(key=lambda item: item[0])
+        return [token for _, token in due_items[: self._REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE]]
 
-        updated = 0
-        missing = 0
+    def keepalive_refresh_tokens(self, access_tokens: list[str]) -> dict[str, Any]:
+        access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
+        if not access_tokens:
+            return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
+
+        refreshed = 0
         errors = []
-        token_map = {}
-        max_workers = min(8, len(tokens))
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    self.ensure_oauth_metadata,
-                    token,
-                    allow_remote=allow_remote,
-                    allow_token_refresh=allow_token_refresh,
-                    event=event,
-                ): token
-                for token in tokens
-            }
-            for future in as_completed(futures):
-                token = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    missing += 1
-                    errors.append({"token": anonymize_token(token), "error": str(exc)})
-                    continue
-                if result.get("chatgpt_account_id"):
-                    updated += 1
-                    new_token = str(result.get("access_token") or token).strip()
-                    if new_token and new_token != token:
-                        token_map[token] = new_token
-                else:
-                    missing += 1
-                    if result.get("error"):
-                        errors.append({"token": anonymize_token(token), "error": result.get("error")})
+        for access_token in access_tokens:
+            before = self.resolve_access_token(access_token)
+            after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
+            account = self.get_account(after)
+            if account and str(account.get("last_token_refresh_error") or "").strip():
+                errors.append({
+                    "token": anonymize_token(before),
+                    "error": str(account.get("last_token_refresh_error") or "refresh token failed"),
+                })
+                continue
+            if account:
+                refreshed += 1
 
         return {
-            "total": len(tokens),
-            "updated": updated,
-            "missing": missing,
+            "refreshed": refreshed,
             "errors": errors,
-            "token_map": token_map,
             "items": self.list_accounts(),
         }
 
@@ -458,30 +505,54 @@ class AccountService:
         with self._lock:
             return list(self._accounts)
 
-    def _list_ready_candidate_tokens(self, excluded_tokens: set[str] | None = None) -> list[str]:
+    def _list_ready_candidate_tokens(
+            self,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> list[str]:
         excluded = set(excluded_tokens or set())
         return [
             token
             for item in self._accounts.values()
             if self._is_image_account_available(item)
+               and self._account_matches_plan_type(item, plan_type)
+               and self._account_matches_any_plan_type(item, plan_types)
+               and self._account_matches_source_type(item, source_type)
                and (token := item.get("access_token") or "")
                and token not in excluded
         ]
 
-    def _list_available_candidate_tokens(self, excluded_tokens: set[str] | None = None) -> list[str]:
+    def _list_available_candidate_tokens(
+            self,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         return [
             token
-            for token in self._list_ready_candidate_tokens(excluded_tokens)
+            for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
 
-    def _acquire_next_candidate_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def _acquire_next_candidate_token(
+            self,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> str:
         with self._image_slot_condition:
             while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens):
-                    raise RuntimeError("no available image quota")
-                tokens = self._list_available_candidate_tokens(excluded_tokens)
+                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                    raise RuntimeError(
+                        f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
+                        if plan_type or source_type else "no available image quota"
+                    )
+                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
                     access_token = tokens[self._index % len(tokens)]
                     self._index += 1
@@ -493,6 +564,7 @@ class AccountService:
         if not access_token:
             return
         with self._image_slot_condition:
+            access_token = self._resolve_access_token_locked(access_token)
             current_inflight = int(self._image_inflight.get(access_token, 0))
             if current_inflight <= 1:
                 self._image_inflight.pop(access_token, None)
@@ -500,23 +572,33 @@ class AccountService:
                 self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
 
-    def get_available_access_token(self) -> str:
+    def get_available_access_token(
+            self,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> str:
         attempted_tokens: set[str] = set()
         while True:
-            access_token = self._acquire_next_candidate_token(excluded_tokens=attempted_tokens)
+            access_token = self._acquire_next_candidate_token(
+                excluded_tokens=attempted_tokens,
+                plan_type=plan_type,
+                source_type=source_type,
+                plan_types=plan_types,
+            )
             attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token", invalidate_on_401=False)
-            except Exception as exc:
-                last_error = str(exc) or exc.__class__.__name__
-                updates = {"last_error": last_error}
-                if "401" in last_error or "unauthorized" in last_error.lower():
-                    updates.update({"status": "异常", "quota": 0})
-                self.update_account(access_token, updates)
+                account = self.fetch_remote_info(access_token, "get_available_access_token")
+            except Exception:
                 self.release_image_slot(access_token)
                 continue
-            if self._is_image_account_available(account or {}):
-                return access_token
+            if (
+                    self._is_image_account_available(account or {})
+                    and self._account_matches_plan_type(account or {}, plan_type)
+                    and self._account_matches_any_plan_type(account or {}, plan_types)
+                    and self._account_matches_source_type(account or {}, source_type)
+            ):
+                return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
@@ -533,12 +615,13 @@ class AccountService:
                 return ""
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
-            return access_token
+        return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
         with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return
@@ -552,23 +635,17 @@ class AccountService:
 
     def remove_invalid_token(self, access_token: str, event: str) -> bool:
         account = self.get_account(access_token)
-        protected = False
         if account:
-            credential_owner = str(account.get("credential_owner") or "").strip()
             protected = bool(
-                credential_owner
+                str(account.get("credential_owner") or "").strip()
                 or str(account.get("register_job_id") or "").strip()
                 or str(account.get("sub2api_account_id") or "").strip()
             )
-        if protected or not config.auto_remove_invalid_accounts:
-            updates = {"status": "异常", "quota": 0, "last_error": f"invalid token during {event}"}
-            self.update_account(access_token, updates)
             if protected:
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    "账号凭据失效，已标记异常",
-                    {"source": event, "token": anonymize_token(access_token)},
-                )
+                self.update_account(access_token, {"status": "异常", "quota": 0})
+                return False
+        if not config.auto_remove_invalid_accounts:
+            self.update_account(access_token, {"status": "异常", "quota": 0})
             return False
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
@@ -582,6 +659,7 @@ class AccountService:
         if not access_token:
             return None
         with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(access_token)
             return dict(account) if account else None
 
@@ -598,109 +676,121 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
+    @staticmethod
+    def _account_payload_token(item: dict) -> str:
+        return str(item.get("access_token") or item.get("accessToken") or "").strip()
+
+    @staticmethod
+    def _prepare_account_payload(item: dict) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        access_token = AccountService._account_payload_token(item)
+        if not access_token:
+            return None
+        payload = dict(item)
+        payload.pop("accessToken", None)
+        payload["access_token"] = access_token
+        # CPA/Codex 导出文件里的 `type=codex` 是导出格式，不是号池套餐类型。
+        if str(payload.get("type") or "").strip().lower() == "codex":
+            payload["export_type"] = "codex"
+            payload["source_type"] = "codex"
+            payload.pop("type", None)
+        if str(payload.get("export_type") or "").strip().lower() == "codex":
+            payload["source_type"] = "codex"
+        if payload.get("plan_type") and not payload.get("type"):
+            payload["type"] = str(payload.get("plan_type") or "").strip()
+        return payload
+
+    def add_account_items(self, items: list[dict]) -> dict:
+        payloads = [
+            payload
+            for item in items
+            if (payload := self._prepare_account_payload(item)) is not None
+        ]
+        return self._add_account_payloads(payloads)
+
     def add_account_records(self, records: list[dict[str, Any]]) -> dict:
-        records = [record for record in records if isinstance(record, dict) and record.get("access_token")]
-        if not records:
+        payloads = [
+            payload
+            for item in records
+            if (payload := self._prepare_account_payload(item)) is not None
+        ]
+        return self._add_account_payloads(payloads)
+
+    def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
+        tokens = list(dict.fromkeys(token for token in tokens if token))
+        if not tokens:
+            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
+        return self._add_account_payloads([
+            {"access_token": token, "source_type": self._normalize_source_type(source_type)}
+            for token in tokens
+        ])
+
+    def _add_account_payloads(self, payloads: list[dict]) -> dict:
+        deduped: dict[str, dict] = {}
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            access_token = self._account_payload_token(payload)
+            if not access_token:
+                continue
+            current = deduped.get(access_token, {})
+            deduped[access_token] = {**current, **payload, "access_token": access_token}
+
+        if not deduped:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
 
         with self._lock:
             added = 0
             skipped = 0
-            for record in records:
-                access_token = str(record.get("access_token") or "").strip()
-                current_key = access_token
+            for access_token, payload in deduped.items():
                 current = self._accounts.get(access_token)
-                sub2api_account_id = str(record.get("sub2api_account_id") or "").strip()
+                current_key = access_token
+                sub2api_account_id = str(payload.get("sub2api_account_id") or "").strip()
                 if current is None and sub2api_account_id:
                     for token, account in self._accounts.items():
                         if str(account.get("sub2api_account_id") or "").strip() == sub2api_account_id:
                             current_key = token
                             current = account
                             break
-                record_login = record.get("login") if isinstance(record.get("login"), dict) else {}
-                record_oauth = record.get("oauth") if isinstance(record.get("oauth"), dict) else {}
-                record_email = str(
-                    record.get("email") or record_login.get("email") or record_oauth.get("email") or ""
+                payload_login = payload.get("login") if isinstance(payload.get("login"), dict) else {}
+                payload_oauth = payload.get("oauth") if isinstance(payload.get("oauth"), dict) else {}
+                payload_email = str(
+                    payload.get("email") or payload_login.get("email") or payload_oauth.get("email") or ""
                 ).strip().lower()
-                record_owner = str(record.get("credential_owner") or "").strip()
-                if current is None and record_email and record_owner == "chatgpt2api":
+                payload_owner = str(payload.get("credential_owner") or "").strip()
+                if current is None and payload_email and payload_owner == "chatgpt2api":
                     for token, account in self._accounts.items():
-                        account_owner = str(account.get("credential_owner") or "").strip()
-                        if account_owner != "chatgpt2api":
-                            continue
                         account_login = account.get("login") if isinstance(account.get("login"), dict) else {}
                         account_oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
                         account_email = str(
                             account.get("email") or account_login.get("email") or account_oauth.get("email") or ""
                         ).strip().lower()
-                        if account_email == record_email:
+                        if account_email == payload_email and str(account.get("credential_owner") or "").strip() == payload_owner:
                             current_key = token
                             current = account
                             break
                 if current is None:
                     added += 1
-                    current = {}
+                    self._cumulative_total += 1
+                    self._save_cumulative_total()
+                    current = {"created_at": self._now()}
                 else:
                     skipped += 1
+                incoming = dict(payload)
+                if not incoming.get("created_at"):
+                    incoming.pop("created_at", None)
                 account = self._normalize_account(
                     {
                         **current,
-                        **record,
+                        **incoming,
                         "access_token": access_token,
-                        "type": str(record.get("type") or current.get("type") or "free"),
+                        "type": str(incoming.get("type") or current.get("type") or "free"),
                     }
                 )
                 if account is not None:
                     if current_key != access_token:
                         self._accounts.pop(current_key, None)
-                        inflight = self._image_inflight.pop(current_key, None)
-                        if inflight is not None:
-                            self._image_inflight[access_token] = inflight
-                    self._accounts[access_token] = account
-            self._save_accounts()
-            items = [dict(item) for item in self._accounts.values()]
-            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
-                            {"added": added, "skipped": skipped})
-        return {"added": added, "skipped": skipped, "items": items}
-
-    def add_accounts(self, tokens: list[str]) -> dict:
-        return self.add_account_records([{"access_token": token} for token in list(dict.fromkeys(token for token in tokens if token))])
-
-    def add_account_items(self, items: list[dict[str, Any]]) -> dict:
-        payloads: list[dict[str, Any]] = []
-        seen_tokens: set[str] = set()
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            access_token = _clean_string(item.get("access_token") or item.get("accessToken"))
-            if not access_token or access_token in seen_tokens:
-                continue
-
-            payload = dict(item)
-            payload["access_token"] = access_token
-            payload.pop("accessToken", None)
-            if _clean_string(payload.get("type")).lower() == "codex":
-                payload.setdefault("export_type", "codex")
-                payload.pop("type", None)
-            payloads.append(payload)
-            seen_tokens.add(access_token)
-
-        if not payloads:
-            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
-
-        with self._lock:
-            added = 0
-            skipped = 0
-            for payload in payloads:
-                access_token = payload["access_token"]
-                current = self._accounts.get(access_token)
-                if current is None:
-                    added += 1
-                    current = {}
-                else:
-                    skipped += 1
-                account = self._normalize_account({**current, **payload})
-                if account is not None:
                     self._accounts[access_token] = account
             self._save_accounts()
             items = [dict(item) for item in self._accounts.values()]
@@ -713,9 +803,15 @@ class AccountService:
         if not target_set:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
+            target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
+            self._token_aliases = {
+                old: new
+                for old, new in self._token_aliases.items()
+                if old not in target_set and new not in target_set
+            }
             if removed:
                 if self._accounts:
                     self._index %= len(self._accounts)
@@ -730,16 +826,11 @@ class AccountService:
         if not access_token:
             return None
         with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
-            next_item = {**current, **updates, "access_token": access_token}
-            if isinstance(current.get("oauth"), dict) or isinstance(updates.get("oauth"), dict):
-                next_item["oauth"] = {
-                    **(current.get("oauth") if isinstance(current.get("oauth"), dict) else {}),
-                    **(updates.get("oauth") if isinstance(updates.get("oauth"), dict) else {}),
-                }
-            account = self._normalize_account(next_item)
+            account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
@@ -754,11 +845,67 @@ class AccountService:
             return dict(account)
         return None
 
+    def _record_refresh_success(self, access_token: str) -> None:
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return
+            next_item = dict(current)
+            next_item["invalid_count"] = 0
+            next_item["last_invalid_at"] = None
+            next_item["last_refresh_error"] = None
+            next_item["last_refresh_error_at"] = None
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[access_token] = account
+
+    def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
+        if not isinstance(account, dict):
+            return False
+        created_at = self._parse_time(account.get("created_at"))
+        if created_at is not None and (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS:
+            return True
+        last_invalid_at = self._parse_time(account.get("last_invalid_at"))
+        invalid_count = int(account.get("invalid_count") or 0)
+        if invalid_count <= 1:
+            return True
+        if last_invalid_at is not None and (now - last_invalid_at).total_seconds() < self._INVALID_CONFIRM_SECONDS:
+            return True
+        return False
+
+    def _record_invalid_token_seen(self, access_token: str, event: str, error: str) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return True
+            should_defer = self._should_defer_invalid_token(current, now)
+            next_item = dict(current)
+            next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+            next_item["last_invalid_at"] = now.isoformat()
+            next_item["last_refresh_error"] = str(error or "invalid access token")
+            next_item["last_refresh_error_at"] = now.isoformat()
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[access_token] = account
+                self._save_accounts()
+            if should_defer:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "暂缓标记异常账号",
+                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+                )
+                return False
+        return True
+
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
             return None
         self.release_image_slot(access_token)
         with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
@@ -789,121 +936,32 @@ class AccountService:
             return dict(account)
         return None
 
-    def fetch_remote_info(self, access_token: str, event: str = "fetch_remote_info", *, invalidate_on_401: bool = True) -> dict[str, Any] | None:
+    def fetch_remote_info(self, access_token: str, event: str = "fetch_remote_info") -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
+        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(access_token).get_user_info()
-        except InvalidAccessTokenError:
-            if invalidate_on_401:
-                self.remove_invalid_token(access_token, event)
-            raise
-        return self.update_account(access_token, result)
+            result = OpenAIBackendAPI(active_token).get_user_info()
+        except InvalidAccessTokenError as exc:
+            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
+            if refreshed_token and refreshed_token != active_token:
+                try:
+                    result = OpenAIBackendAPI(refreshed_token).get_user_info()
+                except InvalidAccessTokenError as retry_exc:
+                    if self._record_invalid_token_seen(refreshed_token, event, str(retry_exc)):
+                        self.remove_invalid_token(refreshed_token, event)
+                    raise
+                active_token = refreshed_token
+            else:
+                if self._record_invalid_token_seen(active_token, event, str(exc)):
+                    self.remove_invalid_token(active_token, event)
+                raise
+        self._record_refresh_success(active_token)
+        return self.update_account(active_token, result)
 
-    @staticmethod
-    def _is_retryable_remote_error(error: Exception) -> bool:
-        text = str(error or "").lower()
-        markers = (
-            "http 408",
-            "http 409",
-            "http 425",
-            "http 429",
-            "http 500",
-            "http 502",
-            "http 503",
-            "http 504",
-            "status=408",
-            "status=409",
-            "status=425",
-            "status=429",
-            "status=500",
-            "status=502",
-            "status=503",
-            "status=504",
-            "timed out",
-            "timeout",
-            "connection",
-            "temporarily unavailable",
-            "remote end closed",
-            "proxy",
-            "tls",
-            "ssl",
-        )
-        return any(marker in text for marker in markers)
-
-    @staticmethod
-    def _is_auth_failure_error(message: str) -> bool:
-        text = str(message or "").lower()
-        markers = (
-            "401",
-            "unauthorized",
-            "token_invalidated",
-            "authentication token has been invalidated",
-            "invalid access token",
-            "invalid_access_token",
-        )
-        return any(marker in text for marker in markers)
-
-    def refresh_account_safely(
-        self,
-        access_token: str,
-        event: str = "refresh_accounts",
-        *,
-        allow_token_refresh: bool = False,
-    ) -> tuple[dict[str, Any] | None, str]:
-        access_token = str(access_token or "").strip()
-        if not access_token:
-            return None, "access_token is required"
-
-        last_error = ""
-        for attempt in range(1, 4):
-            try:
-                return self.fetch_remote_info(access_token, event, invalidate_on_401=False), ""
-            except Exception as exc:
-                last_error = str(exc) or exc.__class__.__name__
-                if not self._is_retryable_remote_error(exc) or attempt >= 3:
-                    break
-                time.sleep(1.5 * attempt)
-
-        account = self.get_account(access_token)
-        if account is None:
-            return None, last_error or "account not found"
-
-        auth_failed = self._is_auth_failure_error(last_error)
-        if not allow_token_refresh or not auth_failed:
-            status_updates = {"last_error": last_error}
-            if auth_failed:
-                status_updates.update({"status": "异常", "quota": 0})
-            self.update_account(access_token, status_updates)
-            return None, last_error
-
-        try:
-            refreshed = self._refresh_oauth_token(account)
-        except Exception as exc:
-            self.update_account(access_token, {"status": "异常", "quota": 0, "last_error": f"{last_error}; refresh failed: {exc}"})
-            return None, f"{last_error}; refresh failed: {exc}" if last_error else f"refresh failed: {exc}"
-
-        if refreshed is None:
-            self.update_account(access_token, {"status": "异常", "quota": 0, "last_error": last_error or "refresh token unavailable"})
-            return None, last_error or "refresh token unavailable"
-
-        refreshed = self._replace_account(access_token, refreshed) or refreshed
-        new_token = str(refreshed.get("access_token") or access_token).strip()
-        for attempt in range(1, 3):
-            try:
-                return self.fetch_remote_info(new_token, event, invalidate_on_401=False), ""
-            except Exception as exc:
-                last_error = str(exc) or exc.__class__.__name__
-                if not self._is_retryable_remote_error(exc) or attempt >= 2:
-                    break
-                time.sleep(1.5 * attempt)
-
-        self.update_account(new_token, {"status": "异常", "quota": 0, "last_error": last_error})
-        return None, last_error
-
-    def refresh_accounts(self, access_tokens: list[str], *, allow_token_refresh: bool = False) -> dict[str, Any]:
+    def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
@@ -914,30 +972,14 @@ class AccountService:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(
-                    self.refresh_account_safely,
-                    token,
-                    "refresh_accounts",
-                    allow_token_refresh=allow_token_refresh,
-                ): token
+                executor.submit(self.fetch_remote_info, token, "refresh_accounts"): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
                 try:
-                    account, error = future.result()
+                    account = future.result()
                 except Exception as exc:
-                    errors.append({
-                        "token": anonymize_token(futures[future]),
-                        "access_token": futures[future],
-                        "error": str(exc),
-                    })
-                    continue
-                if error:
-                    errors.append({
-                        "token": anonymize_token(futures[future]),
-                        "access_token": futures[future],
-                        "error": error,
-                    })
+                    errors.append({"token": anonymize_token(futures[future]), "error": str(exc)})
                     continue
                 if account is not None:
                     refreshed += 1
@@ -949,58 +991,92 @@ class AccountService:
         }
 
     def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
-        requested_tokens = [token for token in dict.fromkeys(access_tokens or []) if token]
+        target_tokens = set(token for token in (access_tokens or []) if token)
         with self._lock:
-            if requested_tokens:
-                accounts = [dict(self._accounts[token]) for token in requested_tokens if token in self._accounts]
-            else:
-                accounts = [dict(item) for item in self._accounts.values()]
+            accounts = [
+                dict(item)
+                for item in self._accounts.values()
+                if not target_tokens or str(item.get("access_token") or "") in target_tokens
+            ]
 
-        export_items: list[dict[str, str]] = []
+        items: list[dict[str, str]] = []
         for account in accounts:
-            access_token = _clean_string(account.get("access_token"))
-            id_token = _clean_string(account.get("id_token"))
-            refresh_token = _clean_string(account.get("refresh_token"))
+            access_token = str(account.get("access_token") or "").strip()
+            refresh_token = str(account.get("refresh_token") or "").strip()
+            id_token = str(account.get("id_token") or "").strip()
             if not access_token or not refresh_token or not id_token:
                 continue
 
-            access_claims = _decode_jwt_payload(access_token)
-            id_claims = _decode_jwt_payload(id_token)
-            access_auth = _nested_dict(access_claims.get("https://api.openai.com/auth"))
-            id_auth = _nested_dict(id_claims.get("https://api.openai.com/auth"))
-            profile = _nested_dict(access_claims.get("https://api.openai.com/profile"))
+            access_payload = self._decode_jwt_payload(access_token)
+            id_payload = self._decode_jwt_payload(id_token)
+            auth_claim = access_payload.get("https://api.openai.com/auth")
+            auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+            profile_claim = access_payload.get("https://api.openai.com/profile")
+            profile_claim = profile_claim if isinstance(profile_claim, dict) else {}
 
             email = (
-                _clean_string(account.get("email"))
-                or _clean_string(profile.get("email"))
-                or _clean_string(id_claims.get("email"))
+                str(account.get("email") or "").strip()
+                or str(profile_claim.get("email") or "").strip()
+                or str(id_payload.get("email") or "").strip()
             )
             account_id = (
-                _clean_string(account.get("account_id"))
-                or _clean_string(access_auth.get("chatgpt_account_id"))
-                or _clean_string(id_auth.get("chatgpt_account_id"))
+                str(account.get("account_id") or "").strip()
+                or str(auth_claim.get("chatgpt_account_id") or "").strip()
+                or str(account.get("user_id") or "").strip()
             )
-            expired = _clean_string(account.get("expired")) or _format_timestamp(access_claims.get("exp"))
-            last_refresh = (
-                _clean_string(account.get("last_refresh"))
-                or _format_timestamp(access_claims.get("iat"))
-                or _format_timestamp(access_claims.get("nbf"))
-            )
+            item = {
+                "type": str(account.get("export_type") or "codex"),
+                "email": email,
+                "account_id": account_id,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "expired": self._timestamp_to_iso(access_payload.get("exp")),
+                "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
+            }
+            password = str(account.get("password") or "").strip()
+            if password:
+                item["password"] = password
+            items.append(item)
+        return items
 
-            export_items.append(
-                {
-                    "type": _clean_string(account.get("export_type")) or "codex",
-                    "email": email,
-                    "expired": expired,
-                    "id_token": id_token,
-                    "account_id": account_id,
-                    "access_token": access_token,
-                    "last_refresh": last_refresh,
-                    "refresh_token": refresh_token,
-                }
-            )
+    def get_stats(self) -> dict:
+        with self._lock:
+            items = list(self._accounts.values())
+        total = len(items)
+        active = sum(1 for a in items if a.get("status") == "正常")
+        limited = sum(1 for a in items if a.get("status") == "限流")
+        abnormal = sum(1 for a in items if a.get("status") == "异常")
+        disabled = sum(1 for a in items if a.get("status") == "禁用")
+        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
+        unlimited = sum(1 for a in items if a.get("status") == "正常" and bool(a.get("image_quota_unknown")))
+        total_success = sum(int(a.get("success") or 0) for a in items)
+        total_fail = sum(int(a.get("fail") or 0) for a in items)
+        by_type = {}
+        for a in items:
+            t = a.get("type", "unknown")
+            by_type[t] = by_type.get(t, 0) + 1
+        return {
+            "total": total,
+            "cumulative_total": self._cumulative_total,
+            "active": active,
+            "limited": limited,
+            "abnormal": abnormal,
+            "disabled": disabled,
+            "total_quota": total_quota,
+            "unlimited_quota_count": unlimited,
+            "total_success": total_success,
+            "total_fail": total_fail,
+            "by_type": by_type,
+        }
 
-        return export_items
+    def account_health(self) -> dict:
+        stats = self.get_stats()
+        return {
+            "healthy": stats["active"] > 0 or stats["unlimited_quota_count"] > 0,
+            "status": "ok" if stats["active"] > 0 else "degraded",
+            **stats,
+        }
 
 
 account_service = AccountService(config.get_storage_backend())

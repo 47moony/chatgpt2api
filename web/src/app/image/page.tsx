@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { History, LoaderCircle, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ImageComposer } from "@/app/image/components/image-composer";
@@ -21,8 +21,11 @@ import {
   createImageEditTask,
   createImageGenerationTask,
   fetchAccounts,
+  fetchModels,
   fetchImageTasks,
   type Account,
+  type ImageModel,
+  type Model,
   type ImageTask,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -43,13 +46,26 @@ import {
 } from "@/store/image-conversations";
 
 const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_active_conversation_id";
-const IMAGE_SIZE_STORAGE_KEY = "chatgpt2api:image_last_size";
+const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
+const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
+const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
+const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
+const SCROLL_TO_LATEST_THRESHOLD = 160;
 
 function clampImageCount(value: string) {
   return String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
 }
+function parseImageSize(size: string) {
+  const match = size.match(/^(\d+)x(\d+)$/);
+  return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
+}
+
 const activeConversationQueueIds = new Set<string>();
+
+function getResultsDistanceFromBottom(element: HTMLElement) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight;
+}
 
 function buildConversationTitle(prompt: string) {
   const trimmed = prompt.trim();
@@ -102,6 +118,20 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
     bytes[index] = binary.charCodeAt(index);
   }
   return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
+}
+
+function filterImageModels(items: Model[]): ImageModel[] {
+  return items
+    .map((item) => String(item.id || "").trim())
+    .filter((id, index, list) => id.toLowerCase().includes("image") && list.indexOf(id) === index);
+}
+
+function normalizeStoredImageModel(value: string | null, availableModels: ImageModel[]): ImageModel {
+  const normalized = String(value || "").trim();
+  if (normalized && availableModels.includes(normalized)) {
+    return normalized;
+  }
+  return availableModels[0] || "gpt-image-2";
 }
 
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
@@ -341,12 +371,21 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const didLoadQuotaRef = useRef(false);
   const conversationsRef = useRef<ImageConversation[]>([]);
   const resultsViewportRef = useRef<HTMLDivElement>(null);
+  const lastConversationIdRef = useRef<string | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [imagePrompt, setImagePrompt] = useState("");
-  const [imageCount, setImageCount] = useState("1");
-  const [imageSize, setImageSize] = useState("");
+  const [imageCount, setImageCount] = useState("3");
+  const [imageRatio, setImageRatio] = useState("auto");
+  const [imageTier, setImageTier] = useState("1k");
+  const [imageWidth, setImageWidth] = useState("1024");
+  const [imageHeight, setImageHeight] = useState("1024");
+  const [imageQuality, setImageQuality] = useState("auto");
+  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
+  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
@@ -357,6 +396,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [lightboxImages, setLightboxImages] = useState<ImageLightboxItem[]>([]);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<
     | { type: "one"; id: string }
     | { type: "prompt"; conversationId: string; turnId: string }
@@ -403,14 +443,60 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     conversationsRef.current = conversations;
   }, [conversations]);
 
+  const scrollResultsToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    shouldStickToBottomRef.current = true;
+    setShowScrollToLatest(false);
+    element.scrollTo({
+      top: element.scrollHeight,
+      behavior,
+    });
+  }, []);
+
+  const handleResultsScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) {
+      return;
+    }
+
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const element = resultsViewportRef.current;
+      if (!element) {
+        return;
+      }
+
+      const isAwayFromLatest = getResultsDistanceFromBottom(element) > SCROLL_TO_LATEST_THRESHOLD;
+      shouldStickToBottomRef.current = !isAwayFromLatest;
+      setShowScrollToLatest(isAwayFromLatest);
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
     const loadHistory = async () => {
       try {
-        const storedSize = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_SIZE_STORAGE_KEY) : null;
+        const storedRatio = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) : null;
+        const storedTier = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
+        const storedQuality = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
         const storedCount = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
-        setImageSize(storedSize || "");
+        setImageRatio(storedRatio || "1:1");
+        setImageTier(storedTier || "1k");
+        setImageWidth("1024");
+        setImageHeight("1024");
+        setImageQuality(storedQuality || "auto");
         setImageCount(storedCount ? clampImageCount(storedCount) : "1");
 
         const items = await listImageConversations();
@@ -439,6 +525,37 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     };
 
     void loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadImageModels = async () => {
+      try {
+        const data = await fetchModels();
+        const available = filterImageModels(Array.isArray(data.data) ? data.data : []);
+        if (cancelled || available.length === 0) {
+          return;
+        }
+        setImageModels(available);
+        const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
+        setImageModel((current) => {
+          if (available.includes(current)) {
+            return current;
+          }
+          return normalizeStoredImageModel(storedModel, available);
+        });
+      } catch {
+        if (!cancelled) {
+          setImageModels(["gpt-image-2"]);
+        }
+      }
+    };
+
+    void loadImageModels();
     return () => {
       cancelled = true;
     };
@@ -476,14 +593,36 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     if (!selectedConversation) {
+      lastConversationIdRef.current = null;
+      shouldStickToBottomRef.current = true;
+      setShowScrollToLatest(false);
       return;
     }
 
-    resultsViewportRef.current?.scrollTo({
-      top: resultsViewportRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [selectedConversation?.updatedAt, selectedConversation?.turns.length, selectedConversation]);
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    const didSwitchConversation = lastConversationIdRef.current !== selectedConversation.id;
+    lastConversationIdRef.current = selectedConversation.id;
+
+    if (didSwitchConversation) {
+      requestAnimationFrame(() => scrollResultsToLatest("auto"));
+      return;
+    }
+
+    const shouldFollowLatest =
+      shouldStickToBottomRef.current ||
+      getResultsDistanceFromBottom(element) <= SCROLL_TO_LATEST_THRESHOLD;
+
+    if (shouldFollowLatest) {
+      requestAnimationFrame(() => scrollResultsToLatest("smooth"));
+      return;
+    }
+
+    setShowScrollToLatest(true);
+  }, [selectedConversation?.id, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -502,12 +641,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    if (imageSize) {
-      window.localStorage.setItem(IMAGE_SIZE_STORAGE_KEY, imageSize);
-      return;
-    }
-    window.localStorage.removeItem(IMAGE_SIZE_STORAGE_KEY);
-  }, [imageSize]);
+    window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
+    window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
+    window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
+    window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
+  }, [imageRatio, imageTier, imageQuality, imageModel]);
 
   useEffect(() => {
     if (typeof window !== "undefined" && parsedCount > 0) {
@@ -566,6 +704,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, [clearComposerInputs]);
 
   const handleCreateDraft = () => {
+    shouldStickToBottomRef.current = true;
+    setShowScrollToLatest(false);
     setSelectedConversationId(null);
     resetComposer();
     textareaRef.current?.focus();
@@ -779,7 +919,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setSelectedConversationId(conversationId);
     setImagePrompt(turn.prompt);
     setImageCount(String(Math.max(1, turn.count || turn.images.length || 1)));
-    setImageSize(turn.size);
+    setImageRatio(turn.ratio);
+    setImageTier(turn.tier);
+    const parsedSize = parseImageSize(turn.size);
+    setImageWidth(parsedSize.width);
+    setImageHeight(parsedSize.height);
+    setImageQuality(turn.quality);
+    setImageModel(turn.model);
     setReferenceImages(turn.referenceImages);
     setReferenceImageFiles(
       turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
@@ -890,8 +1036,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           pendingImages.map((image) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
-              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size)
-              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size);
+              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
+              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
           }),
         );
         await applyTasks(submitted);
@@ -919,8 +1065,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             const resubmitted = await Promise.all(
               missingImages.map((image) =>
                 activeTurn.mode === "edit"
-                  ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size)
-                  : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size),
+                  ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
+                  : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
               ),
             );
             if (resubmitted.length > 0) {
@@ -991,6 +1137,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         referenceImages: sourceTurn.referenceImages,
         count,
         size: sourceTurn.size,
+        ratio: sourceTurn.ratio,
+        tier: sourceTurn.tier,
+        quality: sourceTurn.quality,
         images: createLoadingImages(nextTurnId, count),
         createdAt: now,
         status: "queued",
@@ -1085,14 +1234,18 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const now = new Date().toISOString();
     const conversationId = targetConversation?.id ?? createId();
     const turnId = createId();
+    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,
-      model: "gpt-image-2",
+      model: imageModel,
       mode: effectiveImageMode,
       referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
       count: parsedCount,
       size: imageSize,
+      ratio: imageRatio,
+      tier: imageTier,
+      quality: imageQuality,
       images: createLoadingImages(turnId, parsedCount),
       createdAt: now,
       status: "queued",
@@ -1110,8 +1263,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           createdAt: now,
           updatedAt: now,
           turns: [draftTurn],
-        };
+      };
 
+    shouldStickToBottomRef.current = true;
+    setShowScrollToLatest(false);
     setSelectedConversationId(conversationId);
     clearComposerInputs();
 
@@ -1203,27 +1358,48 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             </Button>
           </div>
 
-          <div
-            ref={resultsViewportRef}
-            className="hide-scrollbar min-h-0 flex-1 overscroll-contain overflow-y-auto px-1 py-2 sm:px-4 sm:py-4"
-          >
-            <ImageResults
-              selectedConversation={selectedConversation}
-              onOpenLightbox={openLightbox}
-              onContinueEdit={handleContinueEdit}
-              onDeletePrompt={openDeletePromptConfirm}
-              onDeleteResults={openDeleteResultsConfirm}
-              onReuseTurnConfig={handleReuseTurnConfig}
-              onRegenerateTurn={handleRegenerateTurn}
-              onRetryImage={handleRetryImage}
-              formatConversationTime={formatConversationTime}
-            />
+          <div className="relative min-h-0 flex-1">
+            <div
+              ref={resultsViewportRef}
+              onScroll={handleResultsScroll}
+              className="hide-scrollbar h-full overscroll-contain scroll-smooth overflow-y-auto px-1 py-2 sm:px-4 sm:py-4"
+            >
+              <ImageResults
+                selectedConversation={selectedConversation}
+                onOpenLightbox={openLightbox}
+                onContinueEdit={handleContinueEdit}
+                onDeletePrompt={openDeletePromptConfirm}
+                onDeleteResults={openDeleteResultsConfirm}
+                onReuseTurnConfig={handleReuseTurnConfig}
+                onRegenerateTurn={handleRegenerateTurn}
+                onRetryImage={handleRetryImage}
+                formatConversationTime={formatConversationTime}
+              />
+            </div>
+
+            {showScrollToLatest ? (
+              <button
+                type="button"
+                aria-label="滚动到最新消息"
+                title="滚动到最新消息"
+                onClick={() => scrollResultsToLatest("smooth")}
+                className="absolute bottom-4 left-1/2 z-20 inline-flex size-11 -translate-x-1/2 items-center justify-center rounded-full border border-stone-200 bg-white/95 text-stone-700 shadow-lg shadow-stone-200/60 backdrop-blur transition hover:-translate-y-0.5 hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400 dark:border-white/10 dark:bg-stone-800/95 dark:text-stone-100 dark:shadow-black/40 dark:hover:bg-stone-700"
+              >
+                <ArrowDown className="size-5" />
+              </button>
+            ) : null}
           </div>
 
           <ImageComposer
             prompt={imagePrompt}
             imageCount={imageCount}
-            imageSize={imageSize}
+            imageRatio={imageRatio}
+            imageTier={imageTier}
+            imageWidth={imageWidth}
+            imageHeight={imageHeight}
+            imageQuality={imageQuality}
+            imageModel={imageModel}
+            imageModels={imageModels}
             availableQuota={availableQuota}
             activeTaskCount={activeTaskCount}
             referenceImages={referenceImages}
@@ -1231,7 +1407,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             fileInputRef={fileInputRef}
             onPromptChange={setImagePrompt}
             onImageCountChange={(value) => setImageCount(value ? clampImageCount(value) : "")}
-            onImageSizeChange={setImageSize}
+            onImageRatioChange={setImageRatio}
+            onImageTierChange={setImageTier}
+            onImageWidthChange={setImageWidth}
+            onImageHeightChange={setImageHeight}
+            onImageQualityChange={setImageQuality}
+            onImageModelChange={setImageModel}
             onSubmit={handleSubmit}
             onPickReferenceImage={() => fileInputRef.current?.click()}
             onReferenceImageChange={handleReferenceImageChange}

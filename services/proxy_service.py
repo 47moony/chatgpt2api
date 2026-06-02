@@ -12,17 +12,20 @@ from services.proxy_pool_service import proxy_by_key, proxy_url
 
 
 class ProxySettingsStore:
-    def build_session_kwargs(self, account: dict | None = None, **session_kwargs) -> dict[str, object]:
-        proxy = ""
-        if isinstance(account, dict):
-            account_proxy = account.get("proxy") if isinstance(account.get("proxy"), dict) else None
-            proxy = proxy_url(account_proxy) if account_proxy else ""
-            if not proxy:
+    def build_session_kwargs(self, account: dict | None = None, proxy: str = "", **session_kwargs) -> dict[str, object]:
+        selected_proxy = str(proxy or "").strip()
+        if not selected_proxy and isinstance(account, dict):
+            account_proxy = account.get("proxy")
+            if isinstance(account_proxy, dict):
+                selected_proxy = proxy_url(account_proxy)
+            else:
+                selected_proxy = str(account_proxy or "").strip()
+            if not selected_proxy:
                 proxy_ref = proxy_by_key(str(account.get("proxy_key") or ""))
-                proxy = proxy_url(proxy_ref) if proxy_ref else ""
-        proxy = proxy or config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
+                selected_proxy = proxy_url(proxy_ref) if proxy_ref else ""
+        selected_proxy = selected_proxy or config.get_proxy_settings()
+        if selected_proxy:
+            session_kwargs["proxy"] = selected_proxy
         return session_kwargs
 
 
