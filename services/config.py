@@ -172,6 +172,23 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
         raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
 
 
+_PROCESS_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+_PROCESS_NO_PROXY_ENV_KEYS = ("NO_PROXY", "no_proxy")
+_PROCESS_NO_PROXY_DEFAULTS = ("localhost", "127.0.0.1", "::1", "host.docker.internal")
+
+
+def _merge_no_proxy(value: str) -> str:
+    items = []
+    seen = set()
+    for item in [*str(value or "").split(","), *_PROCESS_NO_PROXY_DEFAULTS]:
+        normalized = item.strip()
+        if not normalized or normalized.lower() in seen:
+            continue
+        seen.add(normalized.lower())
+        items.append(normalized)
+    return ",".join(items)
+
+
 @dataclass(frozen=True)
 class LoadedSettings:
     auth_key: str
@@ -229,6 +246,8 @@ class ConfigStore:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._storage_backend: StorageBackend | None = None
+        self._managed_process_proxy = ""
+        self._managed_no_proxy_original: dict[str, str | None] = {}
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
                 "❌ auth-key 未设置！\n"
@@ -238,6 +257,7 @@ class ConfigStore:
                 "2. 或者在 config.json 中填写：\n"
                 '   "auth-key": "your_real_auth_key"'
             )
+        self.apply_process_proxy_env()
 
     def _load(self) -> dict[str, object]:
         return _read_json_object(self.path, name="config.json")
@@ -399,6 +419,39 @@ class ConfigStore:
     def get_proxy_settings(self) -> str:
         return str(os.getenv("CHATGPT2API_PROXY") or self.data.get("proxy") or "").strip()
 
+    def apply_process_proxy_env(self) -> None:
+        """Bridge the app proxy setting to process env for third-party libraries.
+
+        Most first-party HTTP calls pass proxy settings explicitly. Libraries such
+        as tiktoken read standard proxy environment variables instead, so keep
+        those in sync without overwriting externally supplied process proxies.
+        """
+        proxy = self.get_proxy_settings()
+        previous = self._managed_process_proxy
+        for key in _PROCESS_PROXY_ENV_KEYS:
+            current = os.getenv(key)
+            if proxy:
+                if not current or current == previous:
+                    os.environ[key] = proxy
+                continue
+            if current == previous:
+                os.environ.pop(key, None)
+
+        if proxy:
+            for key in _PROCESS_NO_PROXY_ENV_KEYS:
+                if key not in self._managed_no_proxy_original:
+                    self._managed_no_proxy_original[key] = os.getenv(key)
+                os.environ[key] = _merge_no_proxy(self._managed_no_proxy_original[key] or "")
+        else:
+            for key, original in self._managed_no_proxy_original.items():
+                if original:
+                    os.environ[key] = original
+                else:
+                    os.environ.pop(key, None)
+            self._managed_no_proxy_original.clear()
+
+        self._managed_process_proxy = proxy
+
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
@@ -414,6 +467,7 @@ class ConfigStore:
         next_data.pop("backup_state", None)
         self.data = next_data
         self._save()
+        self.apply_process_proxy_env()
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
