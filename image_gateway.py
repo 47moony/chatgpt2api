@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -327,6 +328,27 @@ def _fetch_upstream_image(image_path: str) -> tuple[bytes, str]:
     return response.content, content_type
 
 
+def _fetch_local_image(image_path: str) -> tuple[bytes, str] | None:
+    normalized_path = _normalize_image_path(image_path)
+    root = (DATA_DIR / "images").resolve()
+    path = (root / normalized_path).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    content_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    return path.read_bytes(), content_type
+
+
+def _fetch_gateway_image(image_path: str) -> tuple[bytes, str]:
+    local = _fetch_local_image(image_path)
+    if local is not None:
+        return local
+    return _fetch_upstream_image(image_path)
+
+
 app = FastAPI(
     title="chatgpt2api image gateway",
     version="1.0.0",
@@ -539,7 +561,7 @@ async def get_image(image_path: str, sig: str = "") -> Response:
     normalized_path = _normalize_image_path(image_path)
     _verify_image_signature(normalized_path, sig)
     try:
-        content, content_type = await run_in_threadpool(_fetch_upstream_image, normalized_path)
+        content, content_type = await run_in_threadpool(_fetch_gateway_image, normalized_path)
     except HTTPException:
         raise
     except Exception as exc:
