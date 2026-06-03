@@ -24,6 +24,18 @@ from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 
 
+_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 4
+_TOKEN_ENCODING_FALLBACK_LOGGED: set[str] = set()
+
+
+class _ApproximateEncoding:
+    def encode(self, text: str, *_args: Any, **_kwargs: Any) -> range:
+        length = len(str(text or ""))
+        if not length:
+            return range(0)
+        return range(max(1, (length + _TOKEN_ESTIMATE_CHARS_PER_TOKEN - 1) // _TOKEN_ESTIMATE_CHARS_PER_TOKEN))
+
+
 class ImageGenerationError(Exception):
     def __init__(
         self,
@@ -160,13 +172,27 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
 
 
 def encoding_for_model(model: str):
+    errors: list[str] = []
     try:
         return tiktoken.encoding_for_model(model)
-    except KeyError:
+    except Exception as exc:
+        errors.append(str(exc))
         try:
             return tiktoken.get_encoding("o200k_base")
-        except KeyError:
-            return tiktoken.get_encoding("cl100k_base")
+        except Exception as fallback_exc:
+            errors.append(str(fallback_exc))
+            try:
+                return tiktoken.get_encoding("cl100k_base")
+            except Exception as final_exc:
+                errors.append(str(final_exc))
+                if model not in _TOKEN_ENCODING_FALLBACK_LOGGED:
+                    _TOKEN_ENCODING_FALLBACK_LOGGED.add(model)
+                    logger.warning({
+                        "event": "token_encoding_fallback",
+                        "model": model,
+                        "errors": errors,
+                    })
+                return _ApproximateEncoding()
 
 
 def count_message_image_tokens(messages: list[dict[str, Any]], model: str) -> int:
