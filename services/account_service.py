@@ -936,16 +936,16 @@ class AccountService:
             return dict(account)
         return None
 
-    def fetch_remote_info(self, access_token: str, event: str = "fetch_remote_info") -> dict[str, Any] | None:
+    def fetch_remote_info(self, access_token: str, event: str = "fetch_remote_info", *, allow_token_refresh: bool = True) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = (self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token) if allow_token_refresh else access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             result = OpenAIBackendAPI(active_token).get_user_info()
         except InvalidAccessTokenError as exc:
-            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
+            refreshed_token = (self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token") or active_token) if allow_token_refresh else active_token
             if refreshed_token and refreshed_token != active_token:
                 try:
                     result = OpenAIBackendAPI(refreshed_token).get_user_info()
@@ -961,7 +961,7 @@ class AccountService:
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 
-    def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
+    def refresh_accounts(self, access_tokens: list[str], *, allow_token_refresh: bool = True) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
@@ -972,14 +972,14 @@ class AccountService:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts"): token
+                executor.submit(self.fetch_remote_info, token, "refresh_accounts", allow_token_refresh=allow_token_refresh): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
                 try:
                     account = future.result()
                 except Exception as exc:
-                    errors.append({"token": anonymize_token(futures[future]), "error": str(exc)})
+                    errors.append({"access_token": futures[future], "token": anonymize_token(futures[future]), "error": str(exc)})
                     continue
                 if account is not None:
                     refreshed += 1
