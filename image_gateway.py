@@ -124,6 +124,17 @@ def _request_timeout() -> float | None:
     return value if value > 0 else None
 
 
+def _max_concurrent_requests() -> int:
+    raw = _clean(os.getenv("IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS"))
+    if not raw:
+        return 2
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2
+    return max(1, min(value, 32))
+
+
 def _require_gateway_key(authorization: str | None, x_api_key: str | None) -> None:
     expected = _gateway_key()
     scheme, _, bearer = _clean(authorization).partition(" ")
@@ -131,6 +142,39 @@ def _require_gateway_key(authorization: str | None, x_api_key: str | None) -> No
     provided = provided or _clean(x_api_key)
     if not expected or not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail={"error": "invalid gateway key"})
+
+
+GATEWAY_MAX_CONCURRENT_REQUESTS = _max_concurrent_requests()
+_GATEWAY_REQUEST_SEMAPHORE = asyncio.Semaphore(GATEWAY_MAX_CONCURRENT_REQUESTS)
+
+
+async def _run_upstream_with_slot(
+    request_id: str,
+    operation: str,
+    attempt: int,
+    func,
+    *args,
+):
+    queued = _GATEWAY_REQUEST_SEMAPHORE.locked()
+    if queued:
+        _log_gateway_event(
+            request_id,
+            f"{operation}_queued",
+            attempt=attempt,
+            max_concurrent=GATEWAY_MAX_CONCURRENT_REQUESTS,
+        )
+    wait_started = time.perf_counter()
+    async with _GATEWAY_REQUEST_SEMAPHORE:
+        queue_wait_ms = round((time.perf_counter() - wait_started) * 1000, 1)
+        if queued or queue_wait_ms >= 1:
+            _log_gateway_event(
+                request_id,
+                f"{operation}_slot_acquired",
+                attempt=attempt,
+                queue_wait_ms=queue_wait_ms,
+                max_concurrent=GATEWAY_MAX_CONCURRENT_REQUESTS,
+            )
+        return await run_in_threadpool(func, *args)
 
 
 def _image_signature(image_path: str) -> str:
@@ -388,7 +432,14 @@ async def generate(
         try:
             attempt_started = time.perf_counter()
             _log_gateway_event(request_id, "generate_attempt_start", attempt=attempts)
-            result = await run_in_threadpool(_post_upstream_generate, body, request_id)
+            result = await _run_upstream_with_slot(
+                request_id,
+                "generate",
+                attempts,
+                _post_upstream_generate,
+                body,
+                request_id,
+            )
             data = result.get("data")
             if not isinstance(data, list) or not data:
                 raise RuntimeError(str(result.get("message") or "image generation returned no image data"))
@@ -505,7 +556,15 @@ async def edit(
         try:
             attempt_started = time.perf_counter()
             _log_gateway_event(request_id, "edit_attempt_start", attempt=attempts)
-            result = await run_in_threadpool(_post_upstream_edit, form, images, request_id)
+            result = await _run_upstream_with_slot(
+                request_id,
+                "edit",
+                attempts,
+                _post_upstream_edit,
+                form,
+                images,
+                request_id,
+            )
             data = result.get("data")
             if not isinstance(data, list) or not data:
                 raise RuntimeError(str(result.get("message") or "image edit returned no image data"))

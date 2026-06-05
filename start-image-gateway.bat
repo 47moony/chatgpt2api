@@ -5,6 +5,7 @@ cd /d "%~dp0"
 
 if "%CHATGPT2API_HOST_PORT%"=="" set "CHATGPT2API_HOST_PORT=3000"
 if "%IMAGE_GATEWAY_PORT%"=="" set "IMAGE_GATEWAY_PORT=3110"
+if "%IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS%"=="" set "IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS=2"
 
 if "%IMAGE_GATEWAY_LAN_IP%"=="" (
   for /f "tokens=*" %%i in ('powershell -NoProfile -Command "$ip = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' -and $_.InterfaceAlias -notlike 'vEthernet*' -and $_.AddressState -eq 'Preferred' } | Sort-Object @{Expression={ if ($_.PrefixOrigin -eq 'Dhcp') { 0 } else { 1 } }}, InterfaceMetric | Select-Object -First 1 -ExpandProperty IPAddress; if (-not $ip) { $ip = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' -and $_.AddressState -eq 'Preferred' } | Sort-Object InterfaceMetric | Select-Object -First 1 -ExpandProperty IPAddress }; $ip"') do set "IMAGE_GATEWAY_LAN_IP=%%i"
@@ -27,6 +28,7 @@ if "%IMAGE_GATEWAY_PUBLIC_BASE_URL%"=="" (
 echo Image gateway upstream: %IMAGE_GATEWAY_UPSTREAM_URL%
 echo Image gateway public URL: %IMAGE_GATEWAY_PUBLIC_BASE_URL%
 echo Image gateway listen port: %IMAGE_GATEWAY_PORT%
+echo Image gateway max concurrent requests: %IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS%
 echo.
 echo Gateway API key file: %CD%\data\image_gateway.key
 echo Use this key only for /generate and /edit, not the main chatgpt2api auth-key.
