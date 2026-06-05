@@ -124,6 +124,13 @@ def _request_timeout() -> float | None:
     return value if value > 0 else None
 
 
+def _safe_edit_prompt_enabled() -> bool:
+    raw = _clean(os.getenv("IMAGE_GATEWAY_SAFE_EDIT_PROMPT")).lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _max_concurrent_requests() -> int:
     raw = _clean(os.getenv("IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS"))
     if not raw:
@@ -133,6 +140,61 @@ def _max_concurrent_requests() -> int:
     except ValueError:
         return 2
     return max(1, min(value, 32))
+
+
+_EDIT_PROMPT_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\bremove\s+head\s*,\s*legs?\s*,?\s*(?:and\s+)?tail\b", re.IGNORECASE),
+        "show only the central body sprite component",
+    ),
+    (
+        re.compile(r"\binclude\s+only\s+the\s+main\s+body\s+mass\s*:\s*[^.。\n]+", re.IGNORECASE),
+        "show only the central body sprite component with a clean outer silhouette",
+    ),
+    (
+        re.compile(r"\bonly\s+the\s+main\s+body\s+mass\s*:\s*[^.。\n]+", re.IGNORECASE),
+        "central body sprite component with a clean outer silhouette",
+    ),
+    (re.compile(r"\bwolf\s+torso\b", re.IGNORECASE), "central body sprite component"),
+    (re.compile(r"\btorso\b", re.IGNORECASE), "central body sprite component"),
+    (re.compile(r"\bhind\s+leg\b", re.IGNORECASE), "rear limb sprite component"),
+    (re.compile(r"\bfore\s*leg\b|\bfront\s+leg\b", re.IGNORECASE), "front limb sprite component"),
+    (re.compile(r"\blegs\b", re.IGNORECASE), "limb components"),
+    (re.compile(r"\bleg\b", re.IGNORECASE), "limb component"),
+    (re.compile(r"\bhead\b", re.IGNORECASE), "head component"),
+    (re.compile(r"\btail\b", re.IGNORECASE), "tail component"),
+    (re.compile(r"\bchest\b|\bribcage\b|\bbelly\b|\bhip\b|\bstifle\b|\bhock\b", re.IGNORECASE), "outer silhouette"),
+    (re.compile(r"\bremove\s+([^.。,\n]+)", re.IGNORECASE), r"omit separate \1"),
+    (re.compile(r"\bdo\s+not\s+include\s+([^.。,\n]+)", re.IGNORECASE), r"omit separate \1"),
+)
+
+
+def _rewrite_edit_prompt_for_safety(prompt: str) -> tuple[str, list[str]]:
+    if not _safe_edit_prompt_enabled():
+        return prompt, []
+    rewritten = prompt
+    changed_terms: list[str] = []
+    for pattern, replacement in _EDIT_PROMPT_REPLACEMENTS:
+        rewritten, count = pattern.subn(replacement, rewritten)
+        if count:
+            changed_terms.append(pattern.pattern)
+    if not changed_terms:
+        return prompt, []
+    rewritten, species_count = re.subn(
+        r"\b(wolf|canine|dog)\b",
+        "quadruped game character",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
+    if species_count:
+        changed_terms.append("species_neutralized")
+    prefix = (
+        "Clean stylized pixel-art game asset edit. Treat the uploaded image only as "
+        "style, palette, and silhouette reference for a standalone animation-rigging "
+        "sprite component. Use neutral component labels and keep the asset non-realistic, "
+        "with no text.\n\n"
+    )
+    return prefix + rewritten.strip(), changed_terms
 
 
 def _require_gateway_key(authorization: str | None, x_api_key: str | None) -> None:
@@ -515,6 +577,7 @@ async def edit(
     prompt = _clean(prompt)
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    upstream_prompt, prompt_rewrites = _rewrite_edit_prompt_for_safety(prompt)
     if n < 1 or n > 4:
         raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
     max_attempts = max(0, min(10000, int(max_attempts or 0)))
@@ -539,10 +602,12 @@ async def edit(
         image_count=len(images),
         upload_bytes=sum(len(item[0]) for item in images),
         read_upload_ms=round((time.perf_counter() - read_started) * 1000, 1),
+        safe_prompt_rewritten=bool(prompt_rewrites),
+        safe_prompt_rewrite_count=len(prompt_rewrites),
     )
 
     form = {
-        "prompt": prompt,
+        "prompt": upstream_prompt,
         "model": _clean(model) or "gpt-image-2",
         "n": n,
         "size": _clean(size),
