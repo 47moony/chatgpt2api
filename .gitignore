@@ -31,3 +31,8 @@ git_cache/
 .claude/settings.json
 config.json
 CODEX_IMAGE*.md
+
+# 调试/测试输出目录
+loginwithpassword_*/
+logwithemailverifycode_*/
+test_batch_output/

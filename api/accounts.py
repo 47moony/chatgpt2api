@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import re
+import uuid
 import zipfile
 from datetime import datetime
 from typing import Any, Literal
@@ -137,6 +139,76 @@ def _is_recoverable_auth_error(message: str) -> bool:
         "refresh_token_missing_client_id",
     )
     return any(marker in text for marker in auth_markers)
+
+
+async def _finalize_refresh_result(result: dict) -> dict:
+    errors = list(result.get("errors") or [])
+    removed = 0
+    failed_tokens = [
+        str(item.get("access_token") or item.get("token") or "").strip()
+        for item in errors
+        if isinstance(item, dict)
+    ]
+    failed_tokens = [token for token in failed_tokens if token]
+
+    if failed_tokens:
+        current_accounts = {
+            str(item.get("access_token") or "").strip(): item
+            for item in account_service.list_accounts()
+            if str(item.get("access_token") or "").strip()
+        }
+        records_by_email, records_by_token = _registered_records_by_email_and_token()
+        terminal_tokens: list[str] = []
+
+        for item in errors:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("access_token") or item.get("token") or "").strip()
+            error = str(item.get("error") or "").strip()
+            if not token:
+                continue
+            account = current_accounts.get(token) or {}
+            email = _account_email(account)
+            record = records_by_token.get(token) or records_by_email.get(email)
+            if register_service.is_terminal_account_error(error):
+                terminal_tokens.append(token)
+                continue
+            if record and str(record.get("password") or "").strip():
+                item["email"] = email or str(record.get("email") or "").strip().lower()
+                item["recovery_skipped_reason"] = "一键刷新不会自动重新登录，请在确认后手动点击恢复凭据"
+
+        if terminal_tokens:
+            delete_result = await run_in_threadpool(lambda: account_service.delete_accounts(terminal_tokens))
+            removed = int(delete_result.get("removed") or 0)
+            terminal_set = set(terminal_tokens)
+            errors = [
+                item
+                for item in errors
+                if str(item.get("access_token") or item.get("token") or "").strip() not in terminal_set
+            ]
+
+    return {
+        **result,
+        "removed": removed,
+        "errors": errors,
+        "items": account_service.list_accounts(),
+    }
+
+
+def _sanitize_refresh_result(result: dict) -> dict:
+    return {
+        **result,
+        "errors": _sanitize_account_errors(list(result.get("errors") or [])),
+        "items": _sanitize_accounts(list(result.get("items") or [])),
+    }
+
+
+def _sanitize_refresh_progress(progress: dict) -> dict:
+    sanitized = dict(progress)
+    result = sanitized.get("result")
+    if isinstance(result, dict):
+        sanitized["result"] = _sanitize_refresh_result(result)
+    return sanitized
 
 
 class UserKeyCreateRequest(BaseModel):
@@ -363,59 +435,36 @@ def create_router() -> APIRouter:
             access_tokens = account_service.list_tokens()
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        result = await run_in_threadpool(lambda: account_service.refresh_accounts(access_tokens, allow_token_refresh=True))
-        errors = list(result.get("errors") or [])
 
-        removed = 0
-        failed_tokens = [
-            str(item.get("access_token") or item.get("token") or "").strip()
-            for item in errors
-            if isinstance(item, dict)
-        ]
-        failed_tokens = [token for token in failed_tokens if token]
+        progress_id = str(uuid.uuid4())
 
-        if failed_tokens:
-            current_accounts = {
-                str(item.get("access_token") or "").strip(): item
-                for item in account_service.list_accounts()
-                if str(item.get("access_token") or "").strip()
-            }
-            records_by_email, records_by_token = _registered_records_by_email_and_token()
-            terminal_tokens: list[str] = []
+        async def _do_refresh():
+            try:
+                result = await run_in_threadpool(
+                    lambda: account_service.refresh_accounts(
+                        access_tokens,
+                        progress_id,
+                        allow_token_refresh=True,
+                        defer_invalid_removal=False,
+                        finish_progress=False,
+                    )
+                )
+                finalized = await _finalize_refresh_result(result)
+                account_service.finish_refresh_progress(progress_id, finalized)
+            except Exception as e:
+                account_service.finish_refresh_progress(progress_id, error=str(e))
 
-            for item in errors:
-                if not isinstance(item, dict):
-                    continue
-                token = str(item.get("access_token") or item.get("token") or "").strip()
-                error = str(item.get("error") or "").strip()
-                if not token:
-                    continue
-                account = current_accounts.get(token) or {}
-                email = _account_email(account)
-                record = records_by_token.get(token) or records_by_email.get(email)
-                if register_service.is_terminal_account_error(error):
-                    terminal_tokens.append(token)
-                    continue
-                if record and str(record.get("password") or "").strip():
-                    item["email"] = email or str(record.get("email") or "").strip().lower()
-                    item["recovery_skipped_reason"] = "一键刷新不会自动重新登录，请在确认后手动点击恢复凭据"
+        asyncio.create_task(_do_refresh())
 
-            if terminal_tokens:
-                delete_result = await run_in_threadpool(lambda: account_service.delete_accounts(terminal_tokens))
-                removed = int(delete_result.get("removed") or 0)
-                terminal_set = set(terminal_tokens)
-                errors = [
-                    item
-                    for item in errors
-                    if str(item.get("access_token") or item.get("token") or "").strip() not in terminal_set
-                ]
+        return {"progress_id": progress_id}
 
-        return {
-            **result,
-            "removed": removed,
-            "errors": _sanitize_account_errors(errors),
-            "items": _sanitize_accounts(account_service.list_accounts()),
-        }
+    @router.get("/api/accounts/refresh/progress/{progress_id}")
+    async def get_refresh_progress(progress_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = account_service.get_refresh_progress(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "progress not found"})
+        return _sanitize_refresh_progress(progress)
 
     @router.post("/api/accounts/recover")
     async def recover_accounts(body: AccountRecoverRequest, authorization: str | None = Header(default=None)):

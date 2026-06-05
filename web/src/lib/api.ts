@@ -97,14 +97,16 @@ type AccountMutationResponse = {
   skipped?: number;
   removed?: number;
   refreshed?: number;
+  relogined?: number;
   errors?: Array<{ access_token: string; error: string }>;
 };
 
-type AccountRefreshResponse = {
+export type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
   removed?: number;
   recovered?: number;
+  relogined?: number;
   errors: Array<{ access_token?: string; token?: string; email?: string; error: string }>;
 };
 
@@ -123,6 +125,17 @@ type AccountRecoverResponse = {
     terminal?: boolean;
     terminal_action?: string;
   }>;
+};
+
+export type RefreshProgressResponse = {
+  total: number;
+  processed: number;
+  done: boolean;
+  error: string | null;
+  status_counts?: Record<string, number>;
+  total_quota?: number;
+  result?: AccountRefreshResponse | null;
+  results?: Array<{ token: string; status: string; error?: string | null }>;
 };
 
 type AccountUpdateResponse = {
@@ -146,8 +159,14 @@ export type SettingsConfig = {
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
+  image_parallel_generation?: boolean;
+  image_settle_enabled?: boolean;
+  image_check_before_hit_enabled?: boolean;
+  image_settle_secs?: number | string;
+  image_timeout_retry_secs?: number | string;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
+  auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
   backup?: BackupSettings;
@@ -257,8 +276,12 @@ export type ImageTask = {
   quality?: string;
   created_at: string;
   updated_at: string;
+  conversation_id?: string;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
   error?: string;
+  progress?: string;
+  elapsed_secs?: number;
+  duration_ms?: number;
 };
 
 type ImageTaskListResponse = {
@@ -424,10 +447,14 @@ export async function deleteAccounts(tokens: string[]) {
 }
 
 export async function refreshAccounts(accessTokens: string[]) {
-  return httpRequest<AccountRefreshResponse>("/api/accounts/refresh", {
+  return httpRequest<{ progress_id: string }>("/api/accounts/refresh", {
     method: "POST",
     body: { access_tokens: accessTokens },
   });
+}
+
+export async function fetchRefreshProgress(progressId: string) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
 }
 
 export async function recoverAccounts(accessTokens: string[]) {
@@ -603,7 +630,15 @@ export async function fetchImageTasks(ids: string[]) {
   if (ids.length > 0) {
     params.set("ids", ids.join(","));
   }
-  return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+  params.set("_t", String(Date.now()));
+  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);
+}
+
+export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
+  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`, {
+    method: "POST",
+    body: { extra_timeout_secs: extraTimeoutSecs },
+  });
 }
 
 export async function fetchSettingsConfig() {
