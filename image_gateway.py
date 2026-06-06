@@ -691,3 +691,57 @@ async def get_image(image_path: str, sig: str = "") -> Response:
     except Exception as exc:
         raise HTTPException(status_code=502, detail={"error": _sanitize_error_text(exc)}) from exc
     return Response(content=content, media_type=content_type)
+
+
+if __name__ == "__main__":
+    import subprocess
+    import uvicorn
+
+    def _pause_before_exit() -> None:
+        if os.name != "nt":
+            return
+        try:
+            input("Press Enter to exit...")
+        except EOFError:
+            pass
+
+    def _windows_excluded_tcp_range(port: int) -> str:
+        if os.name != "nt":
+            return ""
+        try:
+            result = subprocess.run(
+                ["netsh", "interface", "ipv4", "show", "excludedportrange", "protocol=tcp"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return ""
+        for line in result.stdout.splitlines():
+            match = re.match(r"^\s*(\d+)\s+(\d+)", line)
+            if not match:
+                continue
+            start = int(match.group(1))
+            end = int(match.group(2))
+            if start <= port <= end:
+                return f"{start}-{end}"
+        return ""
+
+    port_raw = _clean(os.getenv("IMAGE_GATEWAY_PORT")) or "3110"
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 3110
+    excluded_range = _windows_excluded_tcp_range(port)
+    if excluded_range:
+        print(f"Windows has reserved TCP port {port} in excluded range {excluded_range}.", flush=True)
+        print("Set IMAGE_GATEWAY_PORT to an available port, for example 3210, or remove the Windows port exclusion as Administrator.", flush=True)
+        _pause_before_exit()
+        raise SystemExit(1)
+    print(f"Image gateway upstream: {_upstream_url()}", flush=True)
+    print(f"Image gateway listen port: {port}", flush=True)
+    print("For normal use, start-image-gateway.bat is still recommended because it sets LAN URLs and restarts old processes.", flush=True)
+    uvicorn.run("image_gateway:app", host="0.0.0.0", port=port, access_log=True)
