@@ -3,7 +3,14 @@ setlocal EnableDelayedExpansion
 
 cd /d "%~dp0"
 
-if "%CHATGPT2API_HOST_PORT%"=="" set "CHATGPT2API_HOST_PORT=3000"
+if "%CHATGPT2API_HOST_PORT%"=="" (
+  if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%a in (".env") do (
+      if /I "%%a"=="CHATGPT2API_HOST_PORT" set "CHATGPT2API_HOST_PORT=%%b"
+    )
+  )
+)
+if "%CHATGPT2API_HOST_PORT%"=="" set "CHATGPT2API_HOST_PORT=3300"
 if "%IMAGE_GATEWAY_PORT%"=="" set "IMAGE_GATEWAY_PORT=3200"
 if "%IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS%"=="" set "IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS=2"
 

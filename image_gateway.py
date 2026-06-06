@@ -26,9 +26,10 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
+ENV_FILE = BASE_DIR / ".env"
 GATEWAY_KEY_FILE = DATA_DIR / "image_gateway.key"
 GATEWAY_LOG_FILE = DATA_DIR / "image_gateway.log"
-DEFAULT_UPSTREAM_URL = "http://127.0.0.1:3000"
+DEFAULT_UPSTREAM_URL = "http://127.0.0.1:3300"
 _LOG_LOCK = threading.Lock()
 
 
@@ -72,8 +73,32 @@ def _read_config_auth_key() -> str:
     return _clean(data.get("auth-key"))
 
 
+def _read_env_file_value(name: str) -> str:
+    if not ENV_FILE.exists():
+        return ""
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return ""
+    prefix = name.upper()
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#") or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key.strip().upper() == prefix:
+            return _clean(value)
+    return ""
+
+
 def _upstream_url() -> str:
-    return _clean(os.getenv("IMAGE_GATEWAY_UPSTREAM_URL")) or DEFAULT_UPSTREAM_URL
+    configured = _clean(os.getenv("IMAGE_GATEWAY_UPSTREAM_URL"))
+    if configured:
+        return configured
+    host_port = _clean(os.getenv("CHATGPT2API_HOST_PORT")) or _read_env_file_value("CHATGPT2API_HOST_PORT")
+    if host_port:
+        return f"http://127.0.0.1:{host_port}"
+    return DEFAULT_UPSTREAM_URL
 
 
 def _upstream_auth_key() -> str:
