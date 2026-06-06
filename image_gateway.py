@@ -730,11 +730,11 @@ if __name__ == "__main__":
                 return f"{start}-{end}"
         return ""
 
-    port_raw = _clean(os.getenv("IMAGE_GATEWAY_PORT")) or "3110"
+    port_raw = _clean(os.getenv("IMAGE_GATEWAY_PORT")) or "3200"
     try:
         port = int(port_raw)
     except ValueError:
-        port = 3110
+        port = 3200
     excluded_range = _windows_excluded_tcp_range(port)
     if excluded_range:
         print(f"Windows has reserved TCP port {port} in excluded range {excluded_range}.", flush=True)
