@@ -148,7 +148,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", account: dict[str, Any] | None = None) -> None:
         """初始化后端客户端。
 
         参数：
@@ -158,8 +158,10 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
-        self.account = account_service.get_account(self.access_token) if self.access_token else {}
-        self.account = self.account if isinstance(self.account, dict) else {}
+        stored_account = account_service.get_account(self.access_token) if self.access_token else {}
+        stored_account = stored_account if isinstance(stored_account, dict) else {}
+        hint_account = account if isinstance(account, dict) else {}
+        self.account = {**stored_account, **hint_account}
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
@@ -328,6 +330,11 @@ class OpenAIBackendAPI:
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
             "status": "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常"),
+            "oauth": {
+                "chatgpt_account_id": str(default_account.get("account_id") or "").strip(),
+                "chatgpt_user_id": str(me_payload.get("id") or "").strip(),
+                "email": str(me_payload.get("email") or "").strip(),
+            },
         }
         logger.debug({
             "event": "backend_user_info_result",

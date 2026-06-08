@@ -456,7 +456,6 @@ class RegisterService:
             or not str(record.get("access_token") or "").strip()
             or not str(record.get("refresh_token") or oauth.get("refresh_token") or "").strip()
             or not str(record.get("id_token") or oauth.get("id_token") or "").strip()
-            or not str(oauth.get("chatgpt_account_id") or "").strip()
         )
 
     def recover_registered_accounts(self, emails: list[str], *, force: bool = False) -> dict:
@@ -480,7 +479,7 @@ class RegisterService:
                 errors.append({"email": target, "error": "注册记录不存在"})
                 continue
             if not force and not self._registered_account_needs_recovery(record):
-                errors.append({"email": target, "error": "当前记录未检测到需要重新登录恢复的问题"})
+                errors.append({"email": target, "error": "当前记录未检测到需要重新登录恢复的问题；缺少 chatgpt_account_id 时请先执行导出前检查补齐元数据"})
                 continue
             result, error = self._recover_registered_account_record(record)
             if error:

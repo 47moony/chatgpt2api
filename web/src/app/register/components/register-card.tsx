@@ -105,12 +105,21 @@ export function RegisterCard() {
       || !String((account as { access_token?: string }).access_token || "").trim()
       || !String((account as { refresh_token?: string }).refresh_token || oauth.refresh_token || "").trim()
       || !String((account as { id_token?: string }).id_token || oauth.id_token || "").trim()
-      || !String(oauth.chatgpt_account_id || "").trim()
+    );
+  };
+  const accountMetadataIssue = (account: (typeof visibleRegisteredAccounts)[number]) => {
+    const oauth = (account as { oauth?: Record<string, unknown> }).oauth || {};
+    return Boolean(
+      !accountCredentialIssue(account)
+      && !String(oauth.chatgpt_account_id || "").trim()
     );
   };
   const accountNeedsRecovery = (account: (typeof visibleRegisteredAccounts)[number]) => {
     const check = checkByEmail.get(String(account.email || "").toLowerCase());
-    return accountCredentialIssue(account) || check?.exportable === false;
+    if (accountCredentialIssue(account)) return true;
+    if (!check || check.exportable) return false;
+    const blockingErrors = check.errors.filter((error) => !error.includes("chatgpt_account_id"));
+    return blockingErrors.length > 0;
   };
   const recoverableVisibleEmails = visibleRegisteredAccounts
     .filter(accountNeedsRecovery)
@@ -337,8 +346,8 @@ export function RegisterCard() {
                 </Badge>
               </td>
               <td className="whitespace-nowrap px-3 py-2">
-                <Badge variant={accountCredentialIssue(account) ? "danger" : account.recovered ? "info" : "success"} className="rounded-md">
-                  {accountCredentialIssue(account) ? (account.auth_failed ? "待登录" : "需恢复") : account.recovered ? "已恢复" : "可导出"}
+                <Badge variant={accountCredentialIssue(account) ? "danger" : accountMetadataIssue(account) ? "warning" : account.recovered ? "info" : "success"} className="rounded-md">
+                  {accountCredentialIssue(account) ? (account.auth_failed ? "待登录" : "需恢复") : accountMetadataIssue(account) ? "待补ID" : account.recovered ? "已恢复" : "可导出"}
                 </Badge>
                 {account.error ? (
                   <Popover>
@@ -387,7 +396,7 @@ export function RegisterCard() {
                     className="rounded-lg p-2 text-stone-400 transition hover:bg-emerald-50 hover:text-emerald-600 disabled:opacity-50"
                     onClick={() => void handleRecoverRegisteredAccounts([account.email])}
                     disabled={isSaving || !accountNeedsRecovery(account)}
-                    title="重新登录恢复凭据"
+                    title={accountMetadataIssue(account) ? "缺少 chatgpt_account_id 时请用导出前检查补齐，不需要重新登录" : "重新登录恢复凭据"}
                   >
                     <UserCheck className="size-4" />
                   </button>
