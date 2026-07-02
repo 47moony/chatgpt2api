@@ -152,10 +152,12 @@ class ImageTaskService:
         quality: str = "auto",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
+        masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "images": images or [],
+            "mask": masks or [],
             "model": model,
             "n": 1,
             "size": size,
@@ -480,6 +482,7 @@ class ImageTaskService:
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
+        backend = None
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
@@ -539,6 +542,9 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
             )
+        finally:
+            if backend is not None:
+                backend.close()
 
 
 image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")

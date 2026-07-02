@@ -351,13 +351,12 @@ def list_remote_accounts(server: dict) -> list[dict]:
                 if not isinstance(account, dict):
                     continue
                 credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
-                access_token = _extract_access_token(credentials)
-                if not access_token:
-                    continue
                 account_id = account.get("id")
+                if account_id is None:
+                    continue
                 proxy_id = _extract_proxy_id(account)
                 items.append({
-                    "id": str(account_id) if account_id is not None else _clean(credentials.get("chatgpt_account_id")),
+                    "id": str(account_id),
                     "name": _clean(account.get("name")),
                     "email": _clean(credentials.get("email")) or _clean(account.get("name")),
                     "plan_type": _clean(credentials.get("plan_type")),
@@ -578,6 +577,13 @@ class Sub2APIImportService:
                     completed=int(current.get("completed") or 0) + 1,
                     failed=failed,
                 )
+
+        current = self._config.get_import_job(server_id) or {}
+        self._update_job(
+            server_id,
+            completed=len(account_ids),
+            failed=len(current.get("errors") or []),
+        )
 
         if not records:
             current = self._config.get_import_job(server_id) or {}

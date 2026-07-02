@@ -7,7 +7,7 @@ import base64
 
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
-from services.protocol.chat_completion_cache import chat_completion_cache
+from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
 from utils.helper import extract_image_from_message_content
 
@@ -65,6 +65,60 @@ class ChatCompletionCacheTests(unittest.TestCase):
             first["choices"][0]["message"]["content"],
             second["choices"][0]["message"]["content"],
         )
+
+    def test_cache_key_distinguishes_thinking_effort_inputs(self) -> None:
+        messages = [{"role": "user", "content": "same prompt"}]
+        base = {"model": "auto", "messages": messages}
+
+        default_key = cache_key(base, messages, stream=False)
+        thinking_key = cache_key({**base, "thinking_effort": "high"}, messages, stream=False)
+        reasoning_key = cache_key({**base, "reasoning": {"effort": "high"}}, messages, stream=False)
+
+        self.assertNotEqual(default_key, thinking_key)
+        self.assertNotEqual(default_key, reasoning_key)
+        self.assertNotEqual(thinking_key, reasoning_key)
+
+    def test_chat_completion_reasoning_effort_reaches_conversation_request(self) -> None:
+        captured_efforts: list[str] = []
+
+        def fake_collect_text(_backend, request):
+            captured_efforts.append(request.thinking_effort)
+            return "ok"
+
+        body = {
+            "model": "auto",
+            "reasoning_effort": "xhigh",
+            "messages": [{"role": "user", "content": "use more reasoning"}],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+        ):
+            openai_v1_chat_complete.handle(body)
+
+        self.assertEqual(captured_efforts, ["extended"])
+
+    def test_responses_reasoning_effort_reaches_conversation_request(self) -> None:
+        captured_efforts: list[str] = []
+
+        def fake_stream_text_deltas(_backend, request):
+            captured_efforts.append(request.thinking_effort)
+            yield "ok"
+
+        body = {
+            "model": "auto",
+            "input": "use more reasoning",
+            "reasoning": {"effort": "xhigh"},
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream_text_deltas),
+        ):
+            openai_v1_response.handle(body)
+
+        self.assertEqual(captured_efforts, ["extended"])
 
     def test_repeated_stream_text_completion_replays_cached_chunks(self) -> None:
         calls = 0
@@ -236,6 +290,142 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(model, "auto")
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("cannot execute local tools", str(messages[0]["content"]))
+
+    def test_responses_web_search_tool_returns_search_output(self) -> None:
+        search_result = {
+            "answer": "Latest answer.",
+            "sources": [{"title": "Example", "url": "https://example.com/news", "snippet": "Snippet"}],
+        }
+        body = {
+            "model": "auto",
+            "input": "latest example news",
+            "tools": [{"type": "web_search"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result) as search:
+            response = openai_v1_response.handle(body)
+
+        search.assert_called_once_with("latest example news")
+        self.assertEqual(response["output"][0]["type"], "web_search_call")
+        self.assertEqual(response["output"][0]["status"], "completed")
+        self.assertEqual(response["output"][0]["action"]["query"], "latest example news")
+        message = response["output"][1]
+        self.assertEqual(message["type"], "message")
+        content = message["content"][0]
+        self.assertIn("Latest answer.", content["text"])
+        self.assertEqual(content["annotations"][0]["type"], "url_citation")
+        self.assertEqual(content["annotations"][0]["url"], "https://example.com/news")
+
+    def test_responses_web_search_tool_streams_search_events(self) -> None:
+        search_result = {
+            "answer": "Streamed search answer.",
+            "sources": [{"title": "Example", "url": "https://example.com/stream", "snippet": ""}],
+        }
+        body = {
+            "model": "auto",
+            "stream": True,
+            "input": "stream search",
+            "tools": [{"type": "web_search_preview"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result):
+            events = list(openai_v1_response.handle(body))
+
+        event_types = [event["type"] for event in events]
+        self.assertIn("response.web_search_call.in_progress", event_types)
+        self.assertIn("response.web_search_call.searching", event_types)
+        self.assertIn("response.web_search_call.completed", event_types)
+        completed = events[-1]["response"]
+        self.assertEqual(completed["output"][0]["type"], "web_search_call")
+        self.assertEqual(completed["output"][1]["type"], "message")
+
+    def test_responses_versioned_web_search_tool_returns_search_output(self) -> None:
+        search_result = {
+            "answer": "Versioned search answer.",
+            "sources": [{"title": "Example", "url": "https://example.com/versioned", "snippet": ""}],
+        }
+        body = {
+            "model": "auto",
+            "input": "versioned search",
+            "tools": [{"type": "web_search_preview_2025_03_11"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result) as search:
+            response = openai_v1_response.handle(body)
+
+        search.assert_called_once_with("versioned search")
+        self.assertEqual(response["output"][0]["type"], "web_search_call")
+        self.assertIn("Versioned search answer.", response["output"][1]["content"][0]["text"])
+
+    def test_chat_completions_web_search_tool_returns_search_answer(self) -> None:
+        search_result = {
+            "answer": "Chat search answer.",
+            "sources": [{"title": "Example", "url": "https://example.com/chat", "snippet": ""}],
+        }
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "search chat"}],
+            "tools": [{"type": "web_search"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_chat_complete.run_web_search", return_value=search_result) as search:
+            response = openai_v1_chat_complete.handle(body)
+
+        search.assert_called_once_with("search chat")
+        message = response["choices"][0]["message"]
+        self.assertIn("Chat search answer.", message["content"])
+        self.assertEqual(message["annotations"][0]["type"], "url_citation")
+        self.assertEqual(message["annotations"][0]["url_citation"]["url"], "https://example.com/chat")
+
+    def test_chat_completions_web_search_options_trigger_search(self) -> None:
+        search_result = {
+            "answer": "Options search answer.",
+            "sources": [{"title": "Example", "url": "https://example.com/options", "snippet": ""}],
+        }
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "search options"}],
+            "web_search_options": {"search_context_size": "low"},
+        }
+
+        with mock.patch("services.protocol.openai_v1_chat_complete.run_web_search", return_value=search_result) as search:
+            response = openai_v1_chat_complete.handle(body)
+
+        search.assert_called_once_with("search options")
+        self.assertIn("Options search answer.", response["choices"][0]["message"]["content"])
+
+    def test_chat_completions_search_model_triggers_search(self) -> None:
+        search_result = {
+            "answer": "Search model answer.",
+            "sources": [{"title": "Example", "url": "https://example.com/model", "snippet": ""}],
+        }
+        body = {
+            "model": "gpt-5-search-api-2026-06-01",
+            "messages": [{"role": "user", "content": "search model"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_chat_complete.run_web_search", return_value=search_result) as search:
+            response = openai_v1_chat_complete.handle(body)
+
+        search.assert_called_once_with("search model")
+        self.assertEqual(response["model"], "gpt-5-search-api-2026-06-01")
+        self.assertIn("Search model answer.", response["choices"][0]["message"]["content"])
+
+    def test_chat_completions_search_like_model_does_not_trigger_search(self) -> None:
+        body = {
+            "model": "gpt-5-search-apiary",
+            "messages": [{"role": "user", "content": "not actually a search model"}],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.run_web_search") as search,
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value="plain text answer"),
+        ):
+            response = openai_v1_chat_complete.handle(body)
+
+        search.assert_not_called()
+        self.assertIn("plain text answer", response["choices"][0]["message"]["content"])
 
     def test_chat_completions_accepts_remote_image_url(self) -> None:
         class FakeImageResponse:

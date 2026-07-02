@@ -269,6 +269,10 @@ class RegisterAccountsImportRequest(BaseModel):
     emails: list[str] = []
 
 
+class OutlookPoolResetRequest(BaseModel):
+    scope: str | None = None
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -370,6 +374,11 @@ def create_router() -> APIRouter:
         payload = build_sub2api_export(accounts, include_proxy=proxy)
         suffix = "with-proxy" if proxy else "no-proxy"
         return _json_download(payload, f"sub2api-register-{suffix}.json")
+
+    @router.post("/api/register/outlook-pool/reset")
+    async def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"register": register_service.reset_outlook_pool(body.scope or "all")}
 
     @router.get("/api/register/events")
     async def register_events(token: str = ""):
