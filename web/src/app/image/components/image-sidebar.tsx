@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { LoaderCircle, MessageSquarePlus, Pencil, Trash2 } from "lucide-react";
+import { ArchiveRestore, LoaderCircle, MessageSquarePlus, Pencil, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -13,6 +13,7 @@ type ImageSidebarProps = {
   selectedConversationId: string | null;
   onCreateDraft: () => void;
   onClearHistory: () => void | Promise<void>;
+  onRecoverServerHistory?: () => void | Promise<void>;
   onSelectConversation: (id: string) => void;
   onDeleteConversation: (id: string) => void | Promise<void>;
   onRenameConversation: (id: string, title: string) => void | Promise<void>;
@@ -26,6 +27,7 @@ export function ImageSidebar({
   selectedConversationId,
   onCreateDraft,
   onClearHistory,
+  onRecoverServerHistory,
   onSelectConversation,
   onDeleteConversation,
   onRenameConversation,
@@ -66,19 +68,33 @@ export function ImageSidebar({
     <aside className="h-full min-h-0 overflow-hidden">
       <div className="flex h-full min-h-0 flex-col gap-2 py-1 sm:gap-3 sm:py-2">
         {!hideActionButtons && (
-          <div className="flex items-center gap-2">
-            <Button className="h-10 flex-1 rounded-xl bg-stone-950 text-white hover:bg-stone-800" onClick={onCreateDraft}>
-              <MessageSquarePlus className="size-4" />
-              新建对话
-            </Button>
-            <Button
-              variant="outline"
-              className="h-10 rounded-xl border-stone-200 bg-white/85 px-3 text-stone-600 hover:bg-white"
-              onClick={() => void onClearHistory()}
-              disabled={conversations.length === 0}
-            >
-              <Trash2 className="size-4" />
-            </Button>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Button className="h-10 flex-1 rounded-xl bg-stone-950 text-white hover:bg-stone-800" onClick={onCreateDraft}>
+                <MessageSquarePlus className="size-4" />
+                新建对话
+              </Button>
+              <Button
+                variant="outline"
+                className="h-10 rounded-xl border-stone-200 bg-white/85 px-3 text-stone-600 hover:bg-white"
+                onClick={() => void onClearHistory()}
+                disabled={conversations.length === 0}
+                title="清空历史"
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            </div>
+            {onRecoverServerHistory ? (
+              <Button
+                type="button"
+                variant="outline"
+                className="h-9 w-full rounded-xl border-stone-200 bg-white/85 text-stone-700 hover:bg-white"
+                onClick={() => void onRecoverServerHistory()}
+              >
+                <ArchiveRestore className="size-4" />
+                从服务端恢复历史
+              </Button>
+            ) : null}
           </div>
         )}
 

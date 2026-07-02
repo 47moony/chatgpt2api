@@ -252,6 +252,15 @@ export async function saveImageConversations(conversations: ImageConversation[])
   });
 }
 
+export async function replaceImageConversations(conversations: ImageConversation[]): Promise<void> {
+  await queueImageConversationWrite(async () => {
+    await imageConversationStorage.setItem(
+      IMAGE_CONVERSATIONS_KEY,
+      sortImageConversations(conversations.map(normalizeConversation)),
+    );
+  });
+}
+
 export async function saveImageConversation(conversation: ImageConversation): Promise<void> {
   await queueImageConversationWrite(async () => {
     const items = await readStoredImageConversations();

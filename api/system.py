@@ -21,6 +21,7 @@ from services.image_service import (
     list_images,
     storage_stats,
 )
+from services.image_conversation_recovery_service import image_conversation_recovery_service
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
@@ -117,6 +118,16 @@ def create_router(app_version: str) -> APIRouter:
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return get_image_download_response(image_path)
+
+    @router.get("/api/image-conversations/recover")
+    async def recover_image_conversations(request: Request, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return image_conversation_recovery_service.recover(resolve_image_base_url(request))
+
+    @router.get("/api/image-conversations/recover/original-localhost-3000")
+    async def recover_original_localhost_3000_image_conversations(request: Request, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return image_conversation_recovery_service.recover_original_localhost_3000(resolve_image_base_url(request))
 
     @router.get("/api/logs")
     async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):

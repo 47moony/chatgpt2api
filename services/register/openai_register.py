@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from curl_cffi import requests
 
-from services.proxy_pool_service import load_available_proxies, proxy_url
+from services.proxy_pool_service import load_available_proxies, proxy_key, proxy_url
 from services.register import mail_provider
 
 base_dir = Path(__file__).resolve().parent
@@ -60,6 +60,7 @@ thread_proxy_state = threading.local()
 thread_proxy_lock = threading.Lock()
 thread_proxy_pool: list[dict] = []
 thread_proxy_index = 0
+proxy_cooldowns: dict[str, tuple[float, str]] = {}
 domain_failure_lock = threading.Lock()
 domain_failure_counts: dict[str, int] = {}
 
@@ -390,6 +391,79 @@ def _record_domain_failure(email: str, reason: str, index: int) -> None:
     if count >= threshold:
         mail_provider.suppress_domain(domain, reason, ttl_seconds=ttl)
         step(index, f"邮箱域名 {domain} 连续失败 {count} 次，本轮临时跳过: {reason}", "yellow")
+
+
+def _proxy_failure_ttl(reason: str) -> float:
+    text = str(reason or "").lower()
+    if not text:
+        return 0.0
+    cloudflare_markers = (
+        "被 cloudflare 拦截",
+        "cloudflare",
+        "challenges.cloudflare.com",
+        "just a moment",
+    )
+    network_markers = (
+        "tls connect error",
+        "curl: (35)",
+        "curl: (7)",
+        "could not connect to server",
+        "failed to connect",
+        "connection refused",
+        "connection reset",
+        "timeout",
+        "timed out",
+        "proxy",
+    )
+    if any(marker in text for marker in cloudflare_markers):
+        return 20 * 60
+    if any(marker in text for marker in network_markers):
+        return 5 * 60
+    return 0.0
+
+
+def _record_proxy_failure(proxy: dict | None, reason: str, index: int) -> None:
+    ttl = _proxy_failure_ttl(reason)
+    if ttl <= 0 or not isinstance(proxy, dict):
+        return
+    key = str(proxy.get("proxy_key") or proxy_key(proxy)).strip()
+    if not key:
+        return
+    until = time.monotonic() + ttl
+    with thread_proxy_lock:
+        proxy_cooldowns[key] = (until, str(reason or "proxy failed")[:240])
+    step(index, f"注册代理临时冷却 {int(ttl // 60)} 分钟: {_proxy_label(proxy)}，原因: {reason}", "yellow")
+
+
+def _available_thread_proxies_locked() -> list[dict]:
+    now = time.monotonic()
+    expired = [key for key, (until, _) in proxy_cooldowns.items() if until <= now]
+    for key in expired:
+        proxy_cooldowns.pop(key, None)
+    available: list[dict] = []
+    for proxy in thread_proxy_pool:
+        key = str(proxy.get("proxy_key") or proxy_key(proxy)).strip()
+        if key and key in proxy_cooldowns:
+            continue
+        available.append(proxy)
+    return available
+
+
+def register_proxy_cooldown_wait_seconds() -> float:
+    with thread_proxy_lock:
+        if not thread_proxy_pool:
+            return 0.0
+        if _available_thread_proxies_locked():
+            return 0.0
+        if not proxy_cooldowns:
+            return 0.0
+        now = time.monotonic()
+        return max(1.0, min(until for until, _ in proxy_cooldowns.values()) - now)
+
+
+def has_register_proxy_pool() -> bool:
+    with thread_proxy_lock:
+        return bool(thread_proxy_pool)
 
 
 def build_sub2api_account(result: dict) -> dict:
@@ -1187,6 +1261,7 @@ def reset_thread_proxy_pool() -> None:
         random.shuffle(proxies)
         thread_proxy_pool = proxies
         thread_proxy_index = 0
+        proxy_cooldowns.clear()
     with domain_failure_lock:
         domain_failure_counts.clear()
     mail_provider.clear_suppressed_domains()
@@ -1194,15 +1269,13 @@ def reset_thread_proxy_pool() -> None:
 
 def _thread_proxy() -> dict | None:
     global thread_proxy_index
-    if not hasattr(thread_proxy_state, "proxy"):
-        with thread_proxy_lock:
-            if not thread_proxy_pool:
-                thread_proxy_state.proxy = None
-            else:
-                thread_proxy_state.proxy = dict(thread_proxy_pool[thread_proxy_index % len(thread_proxy_pool)])
-                thread_proxy_index += 1
-    proxy = getattr(thread_proxy_state, "proxy", None)
-    return dict(proxy) if isinstance(proxy, dict) else None
+    with thread_proxy_lock:
+        proxies = _available_thread_proxies_locked()
+        if not proxies:
+            return None
+        proxy = dict(proxies[thread_proxy_index % len(proxies)])
+        thread_proxy_index += 1
+        return proxy
 
 
 def _proxy_label(proxy: dict | None) -> str:
@@ -1215,7 +1288,17 @@ def _recovery_proxies(current_proxy: dict | None, limit: int = 3) -> list[dict |
     current_key = str((current_proxy or {}).get("proxy_key") or "").strip()
     candidates: list[dict | None] = []
     seen = {current_key} if current_key else set()
-    proxies = load_available_proxies()
+    with thread_proxy_lock:
+        cooled_keys = {
+            key
+            for key, (until, _) in proxy_cooldowns.items()
+            if until > time.monotonic()
+        }
+    proxies = [
+        proxy
+        for proxy in load_available_proxies()
+        if str(proxy.get("proxy_key") or proxy_key(proxy)).strip() not in cooled_keys
+    ]
     random.shuffle(proxies)
     for proxy in proxies:
         key = str(proxy.get("proxy_key") or "").strip()
@@ -1226,7 +1309,7 @@ def _recovery_proxies(current_proxy: dict | None, limit: int = 3) -> list[dict |
             seen.add(key)
         if len(candidates) >= limit:
             break
-    if not candidates and current_proxy is None and config["proxy"]:
+    if not candidates and current_proxy is None and config["proxy"] and not has_register_proxy_pool():
         candidates.append(None)
     return candidates
 
@@ -1251,6 +1334,7 @@ def _recover_registered_account(
         except Exception as exc:
             last_error = str(exc) or exc.__class__.__name__
             step(index, f"换代理恢复登录失败: {last_error}", "yellow")
+            _record_proxy_failure(proxy, last_error, index)
             if not PlatformRegistrar._is_retryable_login_error(last_error):
                 break
             time.sleep(2 * attempt)
@@ -1262,6 +1346,16 @@ def _recover_registered_account(
 def worker(index: int, register_job_id: str = "") -> dict:
     start = time.time()
     selected_proxy = _thread_proxy()
+    if selected_proxy is None and has_register_proxy_pool():
+        reason = "所有注册代理都在冷却中，未创建邮箱，请稍后重试"
+        log(f"任务{index} 注册跳过，本次耗时0.0s，原因: {reason}", "yellow")
+        return {
+            "ok": False,
+            "index": index,
+            "error": reason,
+            "registered": None,
+            "deferred": True,
+        }
     registrar_proxy = proxy_url(selected_proxy) if selected_proxy else config["proxy"]
     registrar = PlatformRegistrar(registrar_proxy)
     try:
@@ -1319,6 +1413,7 @@ def worker(index: int, register_job_id: str = "") -> dict:
         else:
             log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
         _record_domain_failure(failed_email, str(e), index)
+        _record_proxy_failure(selected_proxy, str(e), index)
         return {
             "ok": False,
             "index": index,

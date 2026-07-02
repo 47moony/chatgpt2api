@@ -1,4 +1,5 @@
 import { httpRequest, request } from "@/lib/request";
+import type { ImageConversation } from "@/store/image-conversations";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
@@ -287,6 +288,22 @@ export type ImageTask = {
 type ImageTaskListResponse = {
   items: ImageTask[];
   missing_ids: string[];
+};
+
+type ImageConversationRecoveryResponse = {
+  items: ImageConversation[];
+  stats: {
+    available?: boolean;
+    logs?: number;
+    tasks?: number;
+    conversations: number;
+    turns?: number;
+    images: number;
+    missing_images?: number;
+    reference_images?: number;
+    success_log_images?: number;
+    source?: string;
+  };
 };
 
 export type LoginResponse = {
@@ -740,6 +757,14 @@ export async function downloadSingleImage(path: string) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+export async function recoverImageConversationsFromServer() {
+  return httpRequest<ImageConversationRecoveryResponse>("/api/image-conversations/recover");
+}
+
+export async function recoverOriginalLocalhost3000ImageConversations() {
+  return httpRequest<ImageConversationRecoveryResponse>("/api/image-conversations/recover/original-localhost-3000");
 }
 
 export async function fetchImageTags() {

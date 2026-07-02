@@ -8,17 +8,25 @@ from urllib.parse import urlparse
 from curl_cffi.requests import Session
 
 from services.config import config
-from services.proxy_pool_service import proxy_by_key, proxy_url
+from services.proxy_pool_service import proxy_by_key, proxy_key, proxy_url
 
 
 class ProxySettingsStore:
     def build_session_kwargs(self, account: dict | None = None, proxy: str = "", **session_kwargs) -> dict[str, object]:
         selected_proxy = str(proxy or "").strip()
         if not selected_proxy and isinstance(account, dict):
+            proxy_ref = proxy_by_key(str(account.get("proxy_key") or ""))
+            if proxy_ref:
+                selected_proxy = proxy_url(proxy_ref)
             account_proxy = account.get("proxy")
-            if isinstance(account_proxy, dict):
-                selected_proxy = proxy_url(account_proxy)
-            else:
+            if not selected_proxy and isinstance(account_proxy, dict):
+                account_proxy_key = proxy_key(account_proxy)
+                proxy_ref = proxy_by_key(account_proxy_key)
+                if proxy_ref:
+                    selected_proxy = proxy_url(proxy_ref)
+                elif not self._is_stale_local_proxy(account_proxy):
+                    selected_proxy = proxy_url(account_proxy)
+            elif not selected_proxy:
                 selected_proxy = str(account_proxy or "").strip()
             if not selected_proxy:
                 proxy_ref = proxy_by_key(str(account.get("proxy_key") or ""))
@@ -27,6 +35,14 @@ class ProxySettingsStore:
         if selected_proxy:
             session_kwargs["proxy"] = selected_proxy
         return session_kwargs
+
+    @staticmethod
+    def _is_stale_local_proxy(account_proxy: dict) -> bool:
+        host = str(account_proxy.get("host") or "").strip().lower()
+        key = proxy_key(account_proxy)
+        if host not in {"host.docker.internal", "127.0.0.1", "localhost"}:
+            return False
+        return bool(key and proxy_by_key(key) is None)
 
 
 def _clean(value: object) -> str:

@@ -1149,7 +1149,18 @@ class RegisterService:
             futures = set()
             while True:
                 cfg = self.get()
+                cooldown_wait = openai_register.register_proxy_cooldown_wait_seconds()
+                if cooldown_wait > 0 and not futures:
+                    self._append_log(f"所有注册代理都在冷却中，等待 {int(cooldown_wait)} 秒后继续", "yellow")
+                    time.sleep(min(30.0, cooldown_wait))
+                    continue
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                    cooldown_wait = openai_register.register_proxy_cooldown_wait_seconds()
+                    if cooldown_wait > 0:
+                        if not futures:
+                            self._append_log(f"所有注册代理都在冷却中，等待 {int(cooldown_wait)} 秒后继续", "yellow")
+                            time.sleep(min(30.0, cooldown_wait))
+                        break
                     submitted += 1
                     futures.add(executor.submit(self._register_worker, submitted, str(cfg.get("stats", {}).get("job_id") or "")))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)

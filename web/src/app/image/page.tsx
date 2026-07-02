@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
+import { ArchiveRestore, ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ImageComposer } from "@/app/image/components/image-composer";
@@ -23,6 +23,8 @@ import {
   fetchAccounts,
   fetchModels,
   fetchImageTasks,
+  recoverImageConversationsFromServer,
+  recoverOriginalLocalhost3000ImageConversations,
   resumeImagePoll,
   type Account,
   type ImageModel,
@@ -37,6 +39,7 @@ import {
   getImageConversationStats,
   listImageConversations,
   renameImageConversation,
+  replaceImageConversations,
   saveImageConversation,
   saveImageConversations,
   type ImageConversation,
@@ -54,6 +57,7 @@ const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
 const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
+const IMAGE_ORIGINAL_LOCALHOST_3000_RECOVERED_KEY = "chatgpt2api:image_original_localhost_3000_recovered_v1";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
 
 function loadScrollPositions(): Map<string, number> {
@@ -276,6 +280,25 @@ function pickFallbackConversationId(conversations: ImageConversation[]) {
 
 function sortImageConversations(conversations: ImageConversation[]) {
   return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function mergeImageConversations(current: ImageConversation[], recovered: ImageConversation[]) {
+  const currentWithoutGeneratedRecovery = current.filter(
+    (item) => !String(item.id || "").startsWith("server-image-conversation-"),
+  );
+  const conversationMap = new Map(currentWithoutGeneratedRecovery.map((item) => [item.id, item]));
+  let added = 0;
+  let replaced = 0;
+  for (const conversation of recovered) {
+    if (conversationMap.has(conversation.id)) {
+      replaced += 1;
+    } else {
+      added += 1;
+    }
+    conversationMap.set(conversation.id, conversation);
+  }
+  const removedGeneratedRecovery = current.length - currentWithoutGeneratedRecovery.length;
+  return { items: sortImageConversations([...conversationMap.values()]), added, replaced, removedGeneratedRecovery };
 }
 
 function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
@@ -602,7 +625,22 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       setImageCount(storedCount ? clampImageCount(storedCount) : "1");
 
       const items = await listImageConversations();
-      const normalizedItems = await recoverConversationHistory(items);
+      let normalizedItems = await recoverConversationHistory(items);
+      if (isAdmin && typeof window !== "undefined" && !window.localStorage.getItem(IMAGE_ORIGINAL_LOCALHOST_3000_RECOVERED_KEY)) {
+        try {
+          const result = await recoverOriginalLocalhost3000ImageConversations();
+          if (result.stats.available && result.items.length > 0) {
+            const merged = mergeImageConversations(normalizedItems, result.items);
+            if (merged.added > 0 || merged.replaced > 0 || merged.removedGeneratedRecovery > 0) {
+              normalizedItems = merged.items;
+              await replaceImageConversations(normalizedItems);
+            }
+          }
+          window.localStorage.setItem(IMAGE_ORIGINAL_LOCALHOST_3000_RECOVERED_KEY, new Date().toISOString());
+        } catch {
+          // Keep page loading independent from the optional old-port history migration.
+        }
+      }
       if (loadCancelledRef.current) {
         return;
       }
@@ -634,6 +672,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setConversations,
     setSelectedConversationId,
     setIsLoadingHistory,
+    isAdmin,
   ]);
 
   // Handle bfcache (back/forward cache) — re-sync task status on page restore
@@ -994,6 +1033,34 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       toast.error(message);
     }
   };
+
+  const handleRecoverServerHistory = useCallback(async () => {
+    try {
+      let result = await recoverOriginalLocalhost3000ImageConversations();
+      let sourceLabel = "旧端口原始会话";
+      if (!result.stats.available || result.items.length === 0) {
+        result = await recoverImageConversationsFromServer();
+        sourceLabel = "服务端图片记录";
+      }
+      const merged = mergeImageConversations(conversationsRef.current, result.items);
+      if (merged.added === 0 && merged.replaced === 0 && merged.removedGeneratedRecovery === 0) {
+        toast.info("没有发现可新增的服务端图片历史");
+        return;
+      }
+      conversationsRef.current = merged.items;
+      setConversations(merged.items);
+      await replaceImageConversations(merged.items);
+      setSelectedConversationId((current) => current ?? pickFallbackConversationId(merged.items));
+      toast.success(
+        `已恢复 ${sourceLabel}：新增 ${merged.added} 条，更新 ${merged.replaced} 条，包含 ${result.stats.images} 张图片`
+        + (merged.removedGeneratedRecovery > 0 ? `，已移除 ${merged.removedGeneratedRecovery} 条日志重建项` : "")
+        + ((result.stats.missing_images || 0) > 0 ? `，其中 ${result.stats.missing_images} 张文件缺失` : ""),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "恢复服务端历史失败";
+      toast.error(message);
+    }
+  }, []);
 
   const openDeleteConversationConfirm = (id: string) => {
     setIsHistoryOpen(false);
@@ -1592,6 +1659,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             selectedConversationId={selectedConversationId}
             onCreateDraft={handleCreateDraft}
             onClearHistory={openClearHistoryConfirm}
+            onRecoverServerHistory={isAdmin ? handleRecoverServerHistory : undefined}
             onSelectConversation={setSelectedConversationId}
             onDeleteConversation={openDeleteConversationConfirm}
             onRenameConversation={handleRenameConversation}
@@ -1617,6 +1685,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                   setIsHistoryOpen(false);
                 }}
                 onClearHistory={openClearHistoryConfirm}
+                onRecoverServerHistory={
+                  isAdmin
+                    ? async () => {
+                        await handleRecoverServerHistory();
+                        setIsHistoryOpen(false);
+                      }
+                    : undefined
+                }
                 onSelectConversation={(id) => {
                   setSelectedConversationId(id);
                   setIsHistoryOpen(false);
@@ -1655,6 +1731,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             >
               <Trash2 className="size-4" />
             </Button>
+            {isAdmin ? (
+              <Button
+                variant="outline"
+                className="h-10 rounded-2xl border-stone-200 bg-white/85 px-3 text-stone-600 shadow-sm"
+                onClick={() => void handleRecoverServerHistory()}
+                title="从服务端恢复历史"
+              >
+                <ArchiveRestore className="size-4" />
+              </Button>
+            ) : null}
           </div>
 
           <div className="relative min-h-0 flex-1">

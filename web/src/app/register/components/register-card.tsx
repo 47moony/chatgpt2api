@@ -985,7 +985,7 @@ export function RegisterCard() {
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-sm font-semibold text-stone-900">实时日志</h3>
-                <p className="mt-1 text-xs text-amber-700">遇到 HTTP 状态码 400 等错误，基本是邮箱滥用被封，需要更换新的域名邮箱。</p>
+                <p className="mt-1 text-xs text-amber-700">Cloudflare/TLS/连接失败优先检查注册代理；邮箱 API 400 或验证码长期收不到再检查邮箱域名。</p>
               </div>
               <Badge variant="secondary" className="rounded-md">
                 {logs.length}
