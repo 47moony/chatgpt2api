@@ -61,6 +61,18 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _stale_unfinished_timeout_secs() -> float:
+    try:
+        poll_timeout = max(1, int(config.image_poll_timeout_secs))
+    except Exception:
+        poll_timeout = 300
+    try:
+        retry_timeout = max(0, int(config.image_timeout_retry_secs))
+    except Exception:
+        retry_timeout = 30
+    return float(max(600, poll_timeout + retry_timeout + 120))
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -115,6 +127,7 @@ class ImageTaskService:
         with self._lock:
             self._tasks = self._load_locked()
             changed = self._recover_unfinished_locked()
+            changed = self._expire_stale_unfinished_locked() or changed
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
@@ -171,7 +184,7 @@ class ImageTaskService:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
         with self._lock:
-            if self._cleanup_locked():
+            if self._expire_stale_unfinished_locked() or self._cleanup_locked():
                 self._save_locked()
             items = []
             missing_ids = []
@@ -207,7 +220,7 @@ class ImageTaskService:
         now = _now_iso()
         should_start = False
         with self._lock:
-            cleaned = self._cleanup_locked()
+            cleaned = self._expire_stale_unfinished_locked() or self._cleanup_locked()
             task = self._tasks.get(key)
             if task is not None:
                 if cleaned:
@@ -418,6 +431,32 @@ class ImageTaskService:
                 task["error"] = "服务已重启，未完成的图片任务已中断"
                 task["updated_at"] = _now_iso()
                 changed = True
+        return changed
+
+    def _expire_stale_unfinished_locked(self) -> bool:
+        changed = False
+        now = time.time()
+        timeout_secs = _stale_unfinished_timeout_secs()
+        for task in self._tasks.values():
+            if task.get("status") not in UNFINISHED_STATUSES:
+                continue
+            updated_ts = task.get("updated_ts") or task.get("created_ts")
+            try:
+                updated_at = float(updated_ts or 0)
+            except (TypeError, ValueError):
+                updated_at = 0.0
+            if updated_at <= 0 or now - updated_at <= timeout_secs:
+                continue
+            task["status"] = TASK_STATUS_ERROR
+            task["error"] = (
+                f"图片任务长时间无进展（{int(now - updated_at)} 秒未更新）。"
+                "可能是上游连接断开、代理链路不稳定或生图流卡住，请重试。"
+            )
+            task["data"] = []
+            task["duration_ms"] = int(max(0.0, now - float(task.get("created_ts") or updated_at)) * 1000)
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = now
+            changed = True
         return changed
 
     def _cleanup_locked(self) -> bool:
