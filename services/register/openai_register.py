@@ -374,6 +374,10 @@ def _record_domain_failure(email: str, reason: str, index: int) -> None:
     if not domain:
         return
     text = str(reason or "").lower()
+    registration_disallowed_markers = (
+        "registration_disallowed",
+        "cannot create your account with the given information",
+    )
     hard_domain_markers = (
         "user_register_http_400",
         "create_account_http_400",
@@ -386,7 +390,11 @@ def _record_domain_failure(email: str, reason: str, index: int) -> None:
         "tempmail",
         "mail 请求失败",
     )
-    if any(marker in text for marker in hard_domain_markers):
+    if any(marker in text for marker in registration_disallowed_markers):
+        threshold = 1
+        ttl = 24 * 3600
+        reason = f"OpenAI 拒绝该邮箱域名/注册资料: {reason}"
+    elif any(marker in text for marker in hard_domain_markers):
         threshold = 2
         ttl = 6 * 3600
     elif any(marker in text for marker in otp_markers):
@@ -400,6 +408,22 @@ def _record_domain_failure(email: str, reason: str, index: int) -> None:
     if count >= threshold:
         mail_provider.suppress_domain(domain, reason, ttl_seconds=ttl)
         step(index, f"邮箱域名 {domain} 连续失败 {count} 次，本轮临时跳过: {reason}", "yellow")
+
+
+def _create_account_error_message(status_code: object, data: dict, fallback: str) -> str:
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    code = str(error.get("code") or data.get("code") or "").strip()
+    message = str(error.get("message") or data.get("message") or "").strip()
+    detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
+    if code == "registration_disallowed":
+        return (
+            "registration_disallowed: OpenAI 拒绝创建账号，当前邮箱域名或注册资料被风控；"
+            "这不是 Cloudflare/邮箱验证码问题，请更换邮箱域名、邮箱类型或注册资料"
+            f"{detail}"
+        )
+    if message == "Failed to create account. Please try again.":
+        return f"create_account_http_{status_code}: 邮箱域名很可能因滥用被封禁，请更换邮箱域名{detail}"
+    return fallback or f"create_account_http_{status_code}{detail}"
 
 
 def _proxy_failure_ttl(reason: str) -> float:
@@ -1043,10 +1067,13 @@ class PlatformRegistrar:
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
+            error_payload = data.get("error") if isinstance(data.get("error"), dict) else {}
+            if error_payload.get("code") == "registration_disallowed":
+                step(index, "创建账号被 OpenAI 拒绝: 当前邮箱域名或注册资料被风控，请更换邮箱域名/邮箱类型", "yellow")
+            elif data.get("message") == "Failed to create account. Please try again.":
                 step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
-            detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
-            raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+            status_code = getattr(resp, "status_code", "unknown")
+            raise RuntimeError(_create_account_error_message(status_code, data, error))
         data = _response_json(resp)
         callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()

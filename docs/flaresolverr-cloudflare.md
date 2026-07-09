@@ -12,12 +12,13 @@
 4. 后端把 clearance 写入当前注册 session，并重试当前请求一次。
 5. 同进程内会缓存 clearance，后续同 host 请求可复用。
 
-## 启动容器
+## 本地 Docker 部署
 
-推荐直接使用仓库里的 WARP compose：
+本项目自定义版主服务仍然使用 `build-custom.bat` 构建和启动，不建议用 WARP compose 里的 `app` 服务覆盖现有容器。
+这里只启动三个辅助容器，Docker 会自动下载镜像：
 
 ```bash
-docker compose -f docker-compose.warp.yml up -d
+docker compose -f docker-compose.warp.yml up -d warp-proxy privoxy flaresolverr
 ```
 
 相关服务：
@@ -27,7 +28,18 @@ docker compose -f docker-compose.warp.yml up -d
 | `warp-proxy` | 提供 WARP 出站网络 | `socks5://warp-proxy:1080` |
 | `privoxy` | 把 HTTP 代理转发到 WARP | `http://privoxy:8118` |
 | `flaresolverr` | 获取 Cloudflare clearance | `http://flaresolverr:8191` |
-| `app` | chatgpt2api 主服务 | `http://localhost:3000` |
+
+首次部署或修改配置后，写入推荐的清障配置：
+
+```bash
+docker compose -f docker-compose.warp.yml run --rm init-config
+```
+
+然后用自定义脚本重建主服务：
+
+```bat
+build-custom.bat
+```
 
 如果 app 运行在 Docker compose 网络内，FlareSolverr URL 使用：
 
@@ -46,7 +58,7 @@ http://127.0.0.1:8191
 打开：
 
 ```text
-http://localhost:3000/settings/
+http://localhost:3300/settings/
 ```
 
 进入 `FlareSolverr` tab，推荐配置：
@@ -73,7 +85,7 @@ http://localhost:3000/settings/
 打开：
 
 ```text
-http://localhost:3000/register/
+http://localhost:3300/register/
 ```
 
 正常配置邮箱和注册参数即可。遇到 Cloudflare 拦截时，日志会出现类似：

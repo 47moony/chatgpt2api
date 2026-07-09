@@ -100,6 +100,9 @@ class ClearanceBundle:
 
 
 class FlareSolverrClearanceProvider:
+    _request_lock = threading.Lock()
+    _request_attempts = 5
+
     def __init__(self, flaresolverr_url: str, request_method: FlareSolverrRequestMethod | None = None) -> None:
         self.flaresolverr_url = str(flaresolverr_url or "").strip().rstrip("/")
         self._request_method = request_method or self._urllib_post
@@ -119,17 +122,23 @@ class FlareSolverrClearanceProvider:
             payload["proxy"] = {"url": proxy_url}
 
         endpoint = f"{self.flaresolverr_url}/v1"
-        try:
-            body = json.dumps(payload).encode("utf-8")
-            raw_response = self._request_method(
-                endpoint,
-                body,
-                {"Content-Type": "application/json"},
-                timeout,
-            )
-            data = json.loads(raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response)
-        except Exception:
-            return None
+        body = json.dumps(payload).encode("utf-8")
+        data: object = None
+        for attempt in range(self._request_attempts):
+            try:
+                with self._request_lock:
+                    raw_response = self._request_method(
+                        endpoint,
+                        body,
+                        {"Content-Type": "application/json"},
+                        timeout,
+                    )
+                data = json.loads(raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response)
+                break
+            except Exception:
+                if attempt >= self._request_attempts - 1:
+                    return None
+                time.sleep(min(10, 2 * (attempt + 1)))
 
         if not isinstance(data, dict) or str(data.get("status") or "").lower() != "ok":
             return None
@@ -152,7 +161,8 @@ class FlareSolverrClearanceProvider:
     @staticmethod
     def _urllib_post(endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
         req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
-        with urllib_request.urlopen(req, timeout=timeout) as response:
+        opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as response:
             return response.read()
 
 

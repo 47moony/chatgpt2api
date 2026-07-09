@@ -38,8 +38,23 @@ echo Image gateway listen port: %IMAGE_GATEWAY_PORT%
 echo Image gateway max concurrent requests: %IMAGE_GATEWAY_MAX_CONCURRENT_REQUESTS%
 echo.
 echo Gateway API key file: %CD%\data\image_gateway.key
-echo Use this key only for /generate and /edit, not the main chatgpt2api auth-key.
+echo Use this key only for /v1/image-jobs/generations and /v1/image-jobs/edits on this gateway.
+echo Do not share the main chatgpt2api auth-key.
 echo.
+
+if "%IMAGE_GATEWAY_START_NANA%"=="" set "IMAGE_GATEWAY_START_NANA=1"
+if "%NANA_CHROME_PROXY_SERVER%"=="" set "NANA_CHROME_PROXY_SERVER=http://127.0.0.1:7897"
+if /I not "%IMAGE_GATEWAY_START_NANA%"=="0" (
+  echo Starting Nano Banana Chrome for Flow backend...
+  echo Nano Banana Chrome proxy: %NANA_CHROME_PROXY_SERVER%
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_nana_chrome.ps1"
+  if errorlevel 1 (
+    echo Nano Banana Chrome failed to start. gpt-image-2 can still work; Nano Banana models will return a clear error until Chrome is available.
+  ) else (
+    echo Nano Banana Chrome is available or already running.
+  )
+  echo.
+)
 
 powershell -NoProfile -Command "$port = [int]$env:IMAGE_GATEWAY_PORT; $blocked = $false; $hit = ''; netsh interface ipv4 show excludedportrange protocol=tcp | ForEach-Object { if ($_ -match '^\s*(\d+)\s+(\d+)') { $start = [int]$matches[1]; $end = [int]$matches[2]; if ($port -ge $start -and $port -le $end) { $blocked = $true; $hit = \"$start-$end\" } } }; if ($blocked) { Write-Host \"Port $port is inside a Windows excluded TCP port range: $hit\"; exit 2 }; exit 0"
 if errorlevel 2 (
@@ -50,7 +65,7 @@ if errorlevel 2 (
   echo   start-image-gateway.bat
   echo Or remove the Windows port exclusion as Administrator if you must keep %IMAGE_GATEWAY_PORT%.
   echo.
-  pause
+  if /I not "%IMAGE_GATEWAY_PAUSE_ON_EXIT%"=="0" pause
   exit /b 1
 )
 
@@ -62,7 +77,7 @@ if not "%IMAGE_GATEWAY_EXISTING_PID%"=="" (
   powershell -NoProfile -Command "$deadline = (Get-Date).AddSeconds(10); while ((Get-Date) -lt $deadline) { if (-not (Get-NetTCPConnection -LocalPort %IMAGE_GATEWAY_PORT% -State Listen -ErrorAction SilentlyContinue)) { exit 0 }; Start-Sleep -Milliseconds 250 }; exit 1"
   if errorlevel 1 (
     echo Failed to release port %IMAGE_GATEWAY_PORT%. Please close the existing process manually.
-    pause
+    if /I not "%IMAGE_GATEWAY_PAUSE_ON_EXIT%"=="0" pause
     exit /b 1
   )
   echo Existing gateway stopped.
@@ -73,6 +88,6 @@ if not "%IMAGE_GATEWAY_EXISTING_PID%"=="" (
 if errorlevel 1 (
   echo.
   echo Image gateway exited with error code %ERRORLEVEL%.
-  pause
+  if /I not "%IMAGE_GATEWAY_PAUSE_ON_EXIT%"=="0" pause
   exit /b %ERRORLEVEL%
 )

@@ -258,7 +258,15 @@ def _next_domain(domains: list[str]) -> str:
         for domain in expired:
             suppressed_domains.pop(domain, None)
         available = [domain for domain in domains if domain.lower() not in suppressed_domains]
-        candidates = available or domains
+        if not available:
+            reasons = []
+            for domain in domains[:5]:
+                _, reason = suppressed_domains.get(domain.lower(), (0.0, ""))
+                if reason:
+                    reasons.append(f"{domain}: {reason[:160]}")
+            suffix = f"；{'; '.join(reasons)}" if reasons else ""
+            raise RuntimeError(f"所有邮箱域名都在临时跳过中，请稍后重试或更换邮箱域名{suffix}")
+        candidates = available
         if len(candidates) == 1:
             return candidates[0]
         value = candidates[domain_index % len(candidates)]
