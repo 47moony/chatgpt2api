@@ -24,7 +24,6 @@ export type Account = {
   source_type?: string | null;
   status: AccountStatus;
   quota: number;
-  image_quota_unknown?: boolean;
   email?: string | null;
   created_at?: string | null;
   login?: {
